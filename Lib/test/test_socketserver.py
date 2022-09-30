@@ -14,13 +14,16 @@ import unittest
 import socketserver
 
 import test.support
-from test.support import reap_children, reap_threads, verbose, os_helper
+from test.support import reap_children, verbose
+from test.support import os_helper
+from test.support import socket_helper
+from test.support import threading_helper
 
 
 test.support.requires("network")
 
 TEST_STR = b"hello world\n"
-HOST = test.support.HOST
+HOST = socket_helper.HOST
 
 HAVE_UNIX_SOCKETS = hasattr(socket, "AF_UNIX")
 requires_unix_sockets = unittest.skipUnless(HAVE_UNIX_SOCKETS,
@@ -36,7 +39,7 @@ def signal_alarm(n):
 # Remember real select() to avoid interferences with mocking
 _real_select = select.select
 
-def receive(sock, n, timeout=20):
+def receive(sock, n, timeout=test.support.SHORT_TIMEOUT):
     r, w, x = _real_select([sock], [], [], timeout)
     if sock in r:
         return sock.recv(n)
@@ -65,9 +68,7 @@ def simple_subprocess(testcase):
     except:
         raise
     finally:
-        pid2, status = os.waitpid(pid, 0)
-        testcase.assertEqual(pid2, pid)
-        testcase.assertEqual(72 << 8, status)
+        test.support.wait_process(pid, exitcode=72)
 
 
 class SocketServerTest(unittest.TestCase):
@@ -121,7 +122,7 @@ class SocketServerTest(unittest.TestCase):
         self.assertEqual(server.server_address, server.socket.getsockname())
         return server
 
-    @reap_threads
+    @threading_helper.reap_threads
     def run_server(self, svrcls, hdlrbase, testfunc):
         server = self.make_server(self.pickaddr(svrcls.address_family),
                                   svrcls, hdlrbase)
@@ -182,10 +183,18 @@ class SocketServerTest(unittest.TestCase):
                         socketserver.StreamRequestHandler,
                         self.stream_examine)
 
+    # TODO: RUSTPYTHON, AssertionError: -1 != 18446744073709551615
+    if os.name == "nt":
+        test_TCPServer = unittest.expectedFailure(test_TCPServer)
+
     def test_ThreadingTCPServer(self):
         self.run_server(socketserver.ThreadingTCPServer,
                         socketserver.StreamRequestHandler,
                         self.stream_examine)
+
+    # TODO: RUSTPYTHON, AssertionError: -1 != 18446744073709551615
+    if os.name == "nt":
+        test_ThreadingTCPServer = unittest.expectedFailure(test_ThreadingTCPServer)
 
     @requires_forking
     def test_ForkingTCPServer(self):
@@ -219,10 +228,18 @@ class SocketServerTest(unittest.TestCase):
                         socketserver.DatagramRequestHandler,
                         self.dgram_examine)
 
+    # TODO: RUSTPYTHON, AssertionError: -1 != 18446744073709551615
+    if os.name == "nt":
+        test_UDPServer = unittest.expectedFailure(test_UDPServer)
+
     def test_ThreadingUDPServer(self):
         self.run_server(socketserver.ThreadingUDPServer,
                         socketserver.DatagramRequestHandler,
                         self.dgram_examine)
+
+    # TODO: RUSTPYTHON, AssertionError: -1 != 18446744073709551615
+    if os.name == "nt":
+        test_ThreadingUDPServer = unittest.expectedFailure(test_ThreadingUDPServer)
 
     @requires_forking
     def test_ForkingUDPServer(self):
@@ -250,7 +267,7 @@ class SocketServerTest(unittest.TestCase):
                         socketserver.DatagramRequestHandler,
                         self.dgram_examine)
 
-    @reap_threads
+    @threading_helper.reap_threads
     def test_shutdown(self):
         # Issue #2302: shutdown() should always succeed in making an
         # other thread leave serve_forever().
@@ -299,6 +316,10 @@ class SocketServerTest(unittest.TestCase):
             pass
         self.assertEqual(-1, server.socket.fileno())
 
+    # TODO: RUSTPYTHON, AssertionError: -1 != 18446744073709551615
+    if os.name == "nt":
+        test_context_manager = unittest.expectedFailure(test_context_manager)
+
 
 class ErrorHandlerTest(unittest.TestCase):
     """Test that the servers pass normal exceptions from the handler to
@@ -306,7 +327,7 @@ class ErrorHandlerTest(unittest.TestCase):
     KeyboardInterrupt are not passed."""
 
     def tearDown(self):
-        test.os_helper.unlink(test.os_helper.TESTFN)
+        os_helper.unlink(os_helper.TESTFN)
 
     def test_sync_handled(self):
         BaseErrorTestServer(ValueError)
@@ -322,8 +343,11 @@ class ErrorHandlerTest(unittest.TestCase):
         self.check_result(handled=True)
 
     def test_threading_not_handled(self):
-        ThreadingErrorTestServer(SystemExit)
-        self.check_result(handled=False)
+        with threading_helper.catch_threading_exception() as cm:
+            ThreadingErrorTestServer(SystemExit)
+            self.check_result(handled=False)
+
+            self.assertIs(cm.exc_type, SystemExit)
 
     @requires_forking
     def test_forking_handled(self):
@@ -336,7 +360,7 @@ class ErrorHandlerTest(unittest.TestCase):
         self.check_result(handled=False)
 
     def check_result(self, handled):
-        with open(test.os_helper.TESTFN) as log:
+        with open(os_helper.TESTFN) as log:
             expected = 'Handler called\n' + 'Error handled\n' * handled
             self.assertEqual(log.read(), expected)
 
@@ -354,7 +378,7 @@ class BaseErrorTestServer(socketserver.TCPServer):
         self.wait_done()
 
     def handle_error(self, request, client_address):
-        with open(test.os_helper.TESTFN, 'a') as log:
+        with open(os_helper.TESTFN, 'a') as log:
             log.write('Error handled\n')
 
     def wait_done(self):
@@ -363,7 +387,7 @@ class BaseErrorTestServer(socketserver.TCPServer):
 
 class BadHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        with open(test.os_helper.TESTFN, 'a') as log:
+        with open(os_helper.TESTFN, 'a') as log:
             log.write('Handler called\n')
         raise self.server.exception('Test error')
 
@@ -497,8 +521,6 @@ class MiscTestCase(unittest.TestCase):
         self.assertEqual(server.shutdown_called, 1)
         server.server_close()
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_threads_reaped(self):
         """
         In #37193, users reported a memory leak

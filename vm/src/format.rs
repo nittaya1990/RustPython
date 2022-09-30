@@ -1,16 +1,15 @@
 use crate::{
     builtins::{PyBaseExceptionRef, PyStrRef},
     common::float_ops,
-    function::{FuncArgs, IntoPyException},
+    convert::ToPyException,
+    function::FuncArgs,
     stdlib::builtins,
-    ItemProtocol, PyObject, PyObjectRef, PyResult, TypeProtocol, VirtualMachine,
+    AsObject, PyObject, PyObjectRef, PyResult, VirtualMachine,
 };
 use itertools::{Itertools, PeekingNext};
 use num_bigint::{BigInt, Sign};
-use num_traits::cast::ToPrimitive;
-use num_traits::Signed;
-use std::cmp;
-use std::str::FromStr;
+use num_traits::{cast::ToPrimitive, Signed};
+use std::{cmp, str::FromStr};
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 enum FormatPreconversor {
@@ -121,7 +120,7 @@ pub(crate) struct FormatSpec {
 
 pub(crate) fn get_num_digits(text: &str) -> usize {
     for (index, character) in text.char_indices() {
-        if !character.is_digit(10) {
+        if !character.is_ascii_digit() {
             return index;
         }
     }
@@ -380,6 +379,7 @@ impl FormatSpec {
                     magnitude,
                     float_ops::Case::Upper,
                     false,
+                    false,
                 ))
             }
             Some(FormatType::GeneralFormatLower) => {
@@ -388,6 +388,7 @@ impl FormatSpec {
                     precision,
                     magnitude,
                     float_ops::Case::Lower,
+                    false,
                     false,
                 ))
             }
@@ -409,15 +410,23 @@ impl FormatSpec {
             None => match magnitude {
                 magnitude if magnitude.is_nan() => Ok("nan".to_owned()),
                 magnitude if magnitude.is_infinite() => Ok("inf".to_owned()),
-                _ => Ok(float_ops::to_string(magnitude)),
+                _ => match self.precision {
+                    Some(_) => {
+                        let precision = self.precision.unwrap_or(magnitude.to_string().len() - 1);
+                        Ok(float_ops::format_general(
+                            precision,
+                            magnitude,
+                            float_ops::Case::Lower,
+                            false,
+                            true,
+                        ))
+                    }
+                    None => Ok(float_ops::to_string(magnitude)),
+                },
             },
         };
 
-        if raw_magnitude_string_result.is_err() {
-            return raw_magnitude_string_result;
-        }
-
-        let magnitude_string = self.add_magnitude_separators(raw_magnitude_string_result.unwrap());
+        let magnitude_string = self.add_magnitude_separators(raw_magnitude_string_result?);
         let format_sign = self.sign.unwrap_or(FormatSign::Minus);
         let sign_str = if num.is_sign_negative() && !num.is_nan() {
             "-"
@@ -430,6 +439,14 @@ impl FormatSpec {
         };
 
         self.format_sign_and_align(&magnitude_string, sign_str)
+    }
+
+    #[inline]
+    fn format_int_radix(&self, magnitude: BigInt, radix: u32) -> Result<String, &'static str> {
+        match self.precision {
+            Some(_) => Err("Precision not allowed in integer format specifier"),
+            None => Ok(magnitude.to_str_radix(radix)),
+        }
     }
 
     pub(crate) fn format_int(&self, num: &BigInt) -> Result<String, &'static str> {
@@ -446,16 +463,19 @@ impl FormatSpec {
             ""
         };
         let raw_magnitude_string_result: Result<String, &'static str> = match self.format_type {
-            Some(FormatType::Binary) => Ok(magnitude.to_str_radix(2)),
-            Some(FormatType::Decimal) => Ok(magnitude.to_str_radix(10)),
-            Some(FormatType::Octal) => Ok(magnitude.to_str_radix(8)),
-            Some(FormatType::HexLower) => Ok(magnitude.to_str_radix(16)),
-            Some(FormatType::HexUpper) => {
-                let mut result = magnitude.to_str_radix(16);
-                result.make_ascii_uppercase();
-                Ok(result)
-            }
-            Some(FormatType::Number) => Ok(magnitude.to_str_radix(10)),
+            Some(FormatType::Binary) => self.format_int_radix(magnitude, 2),
+            Some(FormatType::Decimal) => self.format_int_radix(magnitude, 10),
+            Some(FormatType::Octal) => self.format_int_radix(magnitude, 8),
+            Some(FormatType::HexLower) => self.format_int_radix(magnitude, 16),
+            Some(FormatType::HexUpper) => match self.precision {
+                Some(_) => Err("Precision not allowed in integer format specifier"),
+                None => {
+                    let mut result = magnitude.to_str_radix(16);
+                    result.make_ascii_uppercase();
+                    Ok(result)
+                }
+            },
+            Some(FormatType::Number) => self.format_int_radix(magnitude, 10),
             Some(FormatType::String) => Err("Unknown format code 's' for object of type 'int'"),
             Some(FormatType::Character) => Err("Unknown format code 'c' for object of type 'int'"),
             Some(FormatType::GeneralFormatUpper) => {
@@ -472,15 +492,12 @@ impl FormatSpec {
                 Some(float) => return self.format_float(float),
                 _ => Err("Unable to convert int to float"),
             },
-            None => Ok(magnitude.to_str_radix(10)),
+            None => self.format_int_radix(magnitude, 10),
         };
-        if raw_magnitude_string_result.is_err() {
-            return raw_magnitude_string_result;
-        }
         let magnitude_string = format!(
             "{}{}",
             prefix,
-            self.add_magnitude_separators(raw_magnitude_string_result.unwrap())
+            self.add_magnitude_separators(raw_magnitude_string_result?)
         );
 
         let format_sign = self.sign.unwrap_or(FormatSign::Minus);
@@ -563,8 +580,8 @@ pub(crate) enum FormatParseError {
     InvalidCharacterAfterRightBracket,
 }
 
-impl IntoPyException for FormatParseError {
-    fn into_pyexception(self, vm: &VirtualMachine) -> PyBaseExceptionRef {
+impl ToPyException for FormatParseError {
+    fn to_pyexception(&self, vm: &VirtualMachine) -> PyBaseExceptionRef {
         match self {
             FormatParseError::UnmatchedBracket => {
                 vm.new_value_error("expected '}' before end of string".to_owned())
@@ -809,8 +826,8 @@ impl FormatString {
                     preconversion_spec,
                     format_spec,
                 } => {
-                    let FieldName { field_type, parts } = FieldName::parse(field_name.as_str())
-                        .map_err(|e| e.into_pyexception(vm))?;
+                    let FieldName { field_type, parts } =
+                        FieldName::parse(field_name.as_str()).map_err(|e| e.to_pyexception(vm))?;
 
                     let mut argument = field_func(field_type)?;
 
@@ -820,7 +837,7 @@ impl FormatString {
                                 argument = argument.get_attr(attribute.as_str(), vm)?;
                             }
                             FieldNamePart::Index(index) => {
-                                argument = argument.get_item(index, vm)?;
+                                argument = argument.get_item(&index, vm)?;
                             }
                             FieldNamePart::StringIndex(index) => {
                                 argument = argument.get_item(&index, vm)?;
@@ -829,7 +846,7 @@ impl FormatString {
                     }
 
                     let nested_format =
-                        FormatString::from_str(format_spec).map_err(|e| e.into_pyexception(vm))?;
+                        FormatString::from_str(format_spec).map_err(|e| e.to_pyexception(vm))?;
                     let format_spec = nested_format.format_internal(vm, field_func)?;
 
                     pystr = call_object_format(vm, argument, *preconversion_spec, &format_spec)?;
@@ -885,12 +902,12 @@ impl FormatString {
             FieldType::Auto | FieldType::Index(_) => {
                 Err(vm.new_value_error("Format string contains positional fields".to_owned()))
             }
-            FieldType::Keyword(keyword) => dict.get_item(keyword, vm),
+            FieldType::Keyword(keyword) => dict.get_item(&keyword, vm),
         })
     }
 }
 
-fn call_object_format(
+pub fn call_object_format(
     vm: &VirtualMachine,
     argument: PyObjectRef,
     preconversion_spec: Option<char>,
@@ -900,10 +917,12 @@ fn call_object_format(
         Some(FormatPreconversor::Str) => argument.str(vm)?.into(),
         Some(FormatPreconversor::Repr) => argument.repr(vm)?.into(),
         Some(FormatPreconversor::Ascii) => vm.ctx.new_str(builtins::ascii(argument, vm)?).into(),
-        Some(FormatPreconversor::Bytes) => vm.call_method(&argument, "decode", ())?,
+        Some(FormatPreconversor::Bytes) => {
+            vm.call_method(&argument, identifier!(vm, decode).as_str(), ())?
+        }
         None => argument,
     };
-    let result = vm.call_special_method(argument, "__format__", (format_spec,))?;
+    let result = vm.call_special_method(argument, identifier!(vm, __format__), (format_spec,))?;
     result.downcast().map_err(|result| {
         vm.new_type_error(format!(
             "__format__ must return a str, not {}",

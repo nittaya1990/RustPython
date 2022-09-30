@@ -1,21 +1,20 @@
 //! Buffer protocol
 //! https://docs.python.org/3/c-api/buffer.html
 
-use itertools::Itertools;
-
 use crate::{
     common::{
         borrow::{BorrowedValue, BorrowedValueMut},
         lock::{MapImmutable, PyMutex, PyMutexGuard},
     },
-    sliceable::wrap_index,
+    object::PyObjectPayload,
+    sliceable::SequenceIndexOp,
     types::{Constructor, Unconstructible},
-    PyObject, PyObjectPayload, PyObjectRef, PyObjectView, PyObjectWrap, PyRef, PyResult,
-    TryFromBorrowedObject, TypeProtocol, VirtualMachine,
+    AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromBorrowedObject,
+    VirtualMachine,
 };
+use itertools::Itertools;
 use std::{borrow::Cow, fmt::Debug, ops::Range};
 
-#[allow(clippy::type_complexity)]
 pub struct BufferMethods {
     pub obj_bytes: fn(&PyBuffer) -> BorrowedValue<[u8]>,
     pub obj_bytes_mut: fn(&PyBuffer) -> BorrowedValueMut<[u8]>,
@@ -63,6 +62,15 @@ impl PyBuffer {
             .then(|| unsafe { self.contiguous_mut_unchecked() })
     }
 
+    pub fn from_byte_vector(bytes: Vec<u8>, vm: &VirtualMachine) -> Self {
+        let bytes_len = bytes.len();
+        PyBuffer::new(
+            PyPayload::into_pyobject(VecBuffer::from(bytes), vm),
+            BufferDescriptor::simple(bytes_len, true),
+            &VEC_BUFFER_METHODS,
+        )
+    }
+
     /// # Safety
     /// assume the buffer is contiguous
     pub unsafe fn contiguous_unchecked(&self) -> BorrowedValue<[u8]> {
@@ -100,7 +108,7 @@ impl PyBuffer {
         f(v)
     }
 
-    pub fn obj_as<T: PyObjectPayload>(&self) -> &PyObjectView<T> {
+    pub fn obj_as<T: PyObjectPayload>(&self) -> &Py<T> {
         unsafe { self.obj.downcast_unchecked_ref() }
     }
 
@@ -132,7 +140,8 @@ impl PyBuffer {
 impl TryFromBorrowedObject for PyBuffer {
     fn try_from_borrowed_object(vm: &VirtualMachine, obj: &PyObject) -> PyResult<Self> {
         let cls = obj.class();
-        if let Some(f) = cls.mro_find_map(|cls| cls.slots.as_buffer) {
+        let as_buffer = cls.mro_find_map(|cls| cls.slots.as_buffer);
+        if let Some(f) = as_buffer {
             return f(obj, vm);
         }
         Err(vm.new_type_error(format!(
@@ -246,7 +255,7 @@ impl BufferDescriptor {
             .cloned()
             .zip_eq(self.dim_desc.iter().cloned())
         {
-            let i = wrap_index(i, shape).ok_or_else(|| {
+            let i = i.wrapped_at(shape).ok_or_else(|| {
                 vm.new_index_error(format!("index out of bounds on dimension {}", i))
             })?;
             pos += i as isize * stride + suboffset;
@@ -378,16 +387,21 @@ impl BufferDescriptor {
 
 pub trait BufferResizeGuard<'a> {
     type Resizable: 'a;
-    fn try_resizable(&'a self, vm: &VirtualMachine) -> PyResult<Self::Resizable>;
+    fn try_resizable_opt(&'a self) -> Option<Self::Resizable>;
+    fn try_resizable(&'a self, vm: &VirtualMachine) -> PyResult<Self::Resizable> {
+        self.try_resizable_opt().ok_or_else(|| {
+            vm.new_buffer_error("Existing exports of data: object cannot be re-sized".to_owned())
+        })
+    }
 }
 
 #[pyclass(module = false, name = "vec_buffer")]
-#[derive(Debug, PyValue)]
+#[derive(Debug, PyPayload)]
 pub struct VecBuffer {
     data: PyMutex<Vec<u8>>,
 }
 
-#[pyimpl(flags(BASETYPE), with(Constructor))]
+#[pyclass(flags(BASETYPE), with(Constructor))]
 impl VecBuffer {
     pub fn take(&self) -> Vec<u8> {
         std::mem::take(&mut self.data.lock())
@@ -408,14 +422,14 @@ impl PyRef<VecBuffer> {
     pub fn into_pybuffer(self, readonly: bool) -> PyBuffer {
         let len = self.data.lock().len();
         PyBuffer::new(
-            self.into_object(),
+            self.into(),
             BufferDescriptor::simple(len, readonly),
             &VEC_BUFFER_METHODS,
         )
     }
 
     pub fn into_pybuffer_with_descriptor(self, desc: BufferDescriptor) -> PyBuffer {
-        PyBuffer::new(self.into_object(), desc, &VEC_BUFFER_METHODS)
+        PyBuffer::new(self.into(), desc, &VEC_BUFFER_METHODS)
     }
 }
 

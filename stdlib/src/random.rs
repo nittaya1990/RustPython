@@ -9,7 +9,7 @@ mod _random {
         builtins::{PyInt, PyTypeRef},
         function::OptionalOption,
         types::Constructor,
-        PyObjectRef, PyResult, PyValue, VirtualMachine,
+        PyObjectRef, PyPayload, PyResult, VirtualMachine,
     };
     use num_bigint::{BigInt, Sign};
     use num_traits::{Signed, Zero};
@@ -56,7 +56,7 @@ mod _random {
 
     #[pyattr]
     #[pyclass(name = "Random")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct PyRandom {
         rng: PyMutex<PyRng>,
     }
@@ -73,11 +73,12 @@ mod _random {
             PyRandom {
                 rng: PyMutex::default(),
             }
-            .into_pyresult_with_type(vm, cls)
+            .into_ref_with_type(vm, cls)
+            .map(Into::into)
         }
     }
 
-    #[pyimpl(flags(BASETYPE), with(Constructor))]
+    #[pyclass(flags(BASETYPE), with(Constructor))]
     impl PyRandom {
         #[pymethod]
         fn random(&self) -> f64 {
@@ -87,9 +88,9 @@ mod _random {
 
         #[pymethod]
         fn seed(&self, n: OptionalOption<PyObjectRef>, vm: &VirtualMachine) -> PyResult<()> {
-            let new_rng = match n.flatten() {
-                None => PyRng::default(),
-                Some(n) => {
+            let new_rng = n
+                .flatten()
+                .map(|n| {
                     // Fallback to using hash if object isn't Int-like.
                     let (_, mut key) = match n.downcast::<PyInt>() {
                         Ok(n) => n.as_bigint().abs(),
@@ -100,62 +101,55 @@ mod _random {
                         key.reverse();
                     }
                     let key = if key.is_empty() { &[0] } else { key.as_slice() };
-                    PyRng::MT(Box::new(mt19937::MT19937::new_with_slice_seed(key)))
-                }
-            };
+                    Ok(PyRng::MT(Box::new(mt19937::MT19937::new_with_slice_seed(
+                        key,
+                    ))))
+                })
+                .transpose()?
+                .unwrap_or_default();
 
             *self.rng.lock() = new_rng;
             Ok(())
         }
 
         #[pymethod]
-        fn getrandbits(&self, k: usize, vm: &VirtualMachine) -> PyResult<BigInt> {
-            if k == 0 {
-                return Err(
-                    vm.new_value_error("number of bits must be greater than zero".to_owned())
-                );
-            }
-
-            let mut rng = self.rng.lock();
-            let mut k = k;
-            let mut gen_u32 = |k| {
-                let r = rng.next_u32();
-                if k < 32 {
-                    r >> (32 - k)
-                } else {
-                    r
+        fn getrandbits(&self, k: isize, vm: &VirtualMachine) -> PyResult<BigInt> {
+            match k {
+                k if k < 0 => {
+                    Err(vm.new_value_error("number of bits must be non-negative".to_owned()))
                 }
-            };
+                0 => Ok(BigInt::zero()),
+                _ => {
+                    let mut rng = self.rng.lock();
+                    let mut k = k;
+                    let mut gen_u32 = |k| {
+                        let r = rng.next_u32();
+                        if k < 32 {
+                            r >> (32 - k)
+                        } else {
+                            r
+                        }
+                    };
 
-            if k <= 32 {
-                return Ok(gen_u32(k).into());
+                    let words = (k - 1) / 32 + 1;
+                    let wordarray = (0..words)
+                        .map(|_| {
+                            let word = gen_u32(k);
+                            k = k.wrapping_sub(32);
+                            word
+                        })
+                        .collect::<Vec<_>>();
+
+                    let uint = num_bigint::BigUint::new(wordarray);
+                    // very unlikely but might as well check
+                    let sign = if uint.is_zero() {
+                        Sign::NoSign
+                    } else {
+                        Sign::Plus
+                    };
+                    Ok(BigInt::from_biguint(sign, uint))
+                }
             }
-
-            let words = (k - 1) / 32 + 1;
-            let wordarray = (0..words)
-                .map(|_| {
-                    let word = gen_u32(k);
-                    k = k.wrapping_sub(32);
-                    word
-                })
-                .collect::<Vec<_>>();
-
-            let uint = num_bigint::BigUint::new(wordarray);
-            // very unlikely but might as well check
-            let sign = if uint.is_zero() {
-                Sign::NoSign
-            } else {
-                Sign::Plus
-            };
-            Ok(BigInt::from_biguint(sign, uint))
-        }
-
-        #[pymethod]
-        fn randbytes(&self, n: usize) -> PyResult<Vec<u8>> {
-            let mut buf = vec![0u8; n];
-            let mut rng = self.rng.lock();
-            rng.fill_bytes(&mut buf);
-            Ok(buf)
         }
     }
 }

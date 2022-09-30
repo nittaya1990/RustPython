@@ -1,7 +1,7 @@
 /* Access to the unicode database.
    See also: https://docs.python.org/3/library/unicodedata.html
 */
-use crate::vm::{PyObjectRef, PyValue, VirtualMachine};
+use crate::vm::{PyObjectRef, PyPayload, VirtualMachine};
 
 pub fn make_module(vm: &VirtualMachine) -> PyObjectRef {
     let module = unicodedata::make_module(vm);
@@ -15,7 +15,7 @@ pub fn make_module(vm: &VirtualMachine) -> PyObjectRef {
         .copied()
     {
         crate::vm::extend_module!(vm, &module, {
-            attr => ucd.clone().get_attr(attr, vm).unwrap(),
+            attr => ucd.get_attr(attr, vm).unwrap(),
         });
     }
 
@@ -25,7 +25,7 @@ pub fn make_module(vm: &VirtualMachine) -> PyObjectRef {
 #[pymodule]
 mod unicodedata {
     use crate::vm::{
-        builtins::PyStrRef, function::OptionalArg, PyObjectRef, PyRef, PyResult, PyValue,
+        builtins::PyStrRef, function::OptionalArg, PyObjectRef, PyPayload, PyRef, PyResult,
         VirtualMachine,
     };
     use itertools::Itertools;
@@ -37,7 +37,7 @@ mod unicodedata {
 
     #[pyattr]
     #[pyclass(name = "UCD")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     pub(super) struct Ucd {
         unic_version: UnicodeVersion,
     }
@@ -64,7 +64,7 @@ mod unicodedata {
         }
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl Ucd {
         #[pymethod]
         fn category(&self, character: PyStrRef, vm: &VirtualMachine) -> PyResult<String> {
@@ -101,12 +101,7 @@ mod unicodedata {
                     }
                 }
             }
-            match default {
-                OptionalArg::Present(obj) => Ok(obj),
-                OptionalArg::Missing => {
-                    Err(vm.new_value_error("character name not found!".to_owned()))
-                }
-            }
+            default.ok_or_else(|| vm.new_value_error("character name not found!".to_owned()))
         }
 
         #[pymethod]
@@ -137,7 +132,7 @@ mod unicodedata {
             Ok(normalized_text)
         }
 
-        #[pyproperty]
+        #[pygetset]
         fn unidata_version(&self) -> String {
             self.unic_version.to_string()
         }

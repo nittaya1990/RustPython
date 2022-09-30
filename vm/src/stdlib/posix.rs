@@ -1,5 +1,4 @@
 use crate::{PyObjectRef, PyResult, VirtualMachine};
-use nix;
 use std::os::unix::io::RawFd;
 
 pub fn raw_set_inheritable(fd: RawFd, inheritable: bool) -> nix::Result<()> {
@@ -31,28 +30,38 @@ pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
 pub mod module {
     use crate::{
         builtins::{PyDictRef, PyInt, PyIntRef, PyListRef, PyStrRef, PyTupleRef, PyTypeRef},
-        function::{IntoPyException, IntoPyObject, OptionalArg},
+        convert::{IntoPyException, ToPyObject, TryFromObject},
+        function::{Either, OptionalArg},
         stdlib::os::{
             errno_err, DirFd, FollowSymlinks, PathOrFd, PyPathLike, SupportFunc, TargetIsDirectory,
             _os, fs_metadata, IOErrorBuilder,
         },
         types::Constructor,
-        utils::{Either, ToCString},
-        ItemProtocol, PyObjectRef, PyResult, PyValue, TryFromObject, TypeProtocol, VirtualMachine,
+        utils::ToCString,
+        AsObject, PyObjectRef, PyPayload, PyResult, VirtualMachine,
     };
     use bitflags::bitflags;
-    use nix::fcntl;
-    use nix::unistd::{self, Gid, Pid, Uid};
-    use std::ffi::{CStr, CString};
-    use std::os::unix::ffi as ffi_ext;
-    use std::os::unix::io::RawFd;
-    use std::{env, fs, io};
+    use nix::{
+        fcntl,
+        unistd::{self, Gid, Pid, Uid},
+    };
+    use std::{
+        env,
+        ffi::{CStr, CString},
+        fs, io,
+        os::unix::{ffi as ffi_ext, io::RawFd},
+    };
     use strum_macros::EnumString;
 
     #[pyattr]
     use libc::{PRIO_PGRP, PRIO_PROCESS, PRIO_USER};
 
-    #[cfg(any(target_os = "dragonfly", target_os = "freebsd", target_os = "linux"))]
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "macos"
+    ))]
     #[pyattr]
     use libc::{SEEK_DATA, SEEK_HOLE};
 
@@ -61,6 +70,9 @@ pub mod module {
     use libc::O_DSYNC;
     #[pyattr]
     use libc::{O_CLOEXEC, O_NONBLOCK, WNOHANG};
+    #[cfg(target_os = "macos")]
+    #[pyattr]
+    use libc::{O_EVTONLY, O_FSYNC, O_NOFOLLOW_ANY, O_SYMLINK};
     #[cfg(not(target_os = "redox"))]
     #[pyattr]
     use libc::{O_NDELAY, O_NOCTTY};
@@ -160,7 +172,7 @@ pub mod module {
 
     // Flags for os_access
     bitflags! {
-        pub struct AccessFlags: u8{
+        pub struct AccessFlags: u8 {
             const F_OK = _os::F_OK;
             const R_OK = _os::R_OK;
             const W_OK = _os::W_OK;
@@ -287,7 +299,7 @@ pub mod module {
         for (key, value) in env::vars_os() {
             let key: PyObjectRef = vm.ctx.new_bytes(key.into_vec()).into();
             let value: PyObjectRef = vm.ctx.new_bytes(value.into_vec()).into();
-            environ.set_item(key, value, vm).unwrap();
+            environ.set_item(&*key, value, vm).unwrap();
         }
 
         environ
@@ -440,7 +452,7 @@ pub mod module {
                 )
             })
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         fn mknod(self, vm: &VirtualMachine) -> PyResult<()> {
             let ret = match self.dir_fd.get_opt() {
                 None => self._mknod(vm)?,
@@ -459,7 +471,7 @@ pub mod module {
                 Ok(())
             }
         }
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         fn mknod(self, vm: &VirtualMachine) -> PyResult<()> {
             let ret = self._mknod(vm)?;
             if ret != 0 {
@@ -512,13 +524,12 @@ pub mod module {
 
     #[pyfunction]
     fn sched_yield(vm: &VirtualMachine) -> PyResult<()> {
-        let _ = nix::sched::sched_yield().map_err(|e| e.into_pyexception(vm))?;
-        Ok(())
+        nix::sched::sched_yield().map_err(|e| e.into_pyexception(vm))
     }
 
     #[pyattr]
     #[pyclass(name = "sched_param")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct SchedParam {
         sched_priority: PyObjectRef,
     }
@@ -531,11 +542,11 @@ pub mod module {
         }
     }
 
-    #[pyimpl(with(Constructor))]
+    #[pyclass(with(Constructor))]
     impl SchedParam {
-        #[pyproperty]
+        #[pygetset]
         fn sched_priority(&self, vm: &VirtualMachine) -> PyObjectRef {
-            self.sched_priority.clone().into_pyobject(vm)
+            self.sched_priority.clone().to_pyobject(vm)
         }
 
         #[pymethod(magic)]
@@ -553,8 +564,9 @@ pub mod module {
             target_os = "freebsd",
             target_os = "android"
         ))]
+        #[cfg(not(target_env = "musl"))]
         fn try_to_libc(&self, vm: &VirtualMachine) -> PyResult<libc::sched_param> {
-            use crate::TypeProtocol;
+            use crate::AsObject;
             let priority_class = self.sched_priority.class();
             let priority_type = priority_class.name();
             let priority = self.sched_priority.clone();
@@ -579,7 +591,8 @@ pub mod module {
             SchedParam {
                 sched_priority: arg.sched_priority,
             }
-            .into_pyresult_with_type(vm, cls)
+            .into_ref_with_type(vm, cls)
+            .map(Into::into)
         }
     }
 
@@ -621,6 +634,7 @@ pub mod module {
         target_os = "freebsd",
         target_os = "android"
     ))]
+    #[cfg(not(target_env = "musl"))]
     #[pyfunction]
     fn sched_setscheduler(args: SchedSetschedulerArgs, vm: &VirtualMachine) -> PyResult<i32> {
         let libc_sched_param = args.sched_param_obj.try_to_libc(vm)?;
@@ -647,7 +661,7 @@ pub mod module {
             param.assume_init()
         };
         Ok(SchedParam {
-            sched_priority: param.sched_priority.into_pyobject(vm),
+            sched_priority: param.sched_priority.to_pyobject(vm),
         })
     }
 
@@ -671,6 +685,7 @@ pub mod module {
         target_os = "freebsd",
         target_os = "android"
     ))]
+    #[cfg(not(target_env = "musl"))]
     #[pyfunction]
     fn sched_setparam(args: SchedSetParamArgs, vm: &VirtualMachine) -> PyResult<i32> {
         let libc_sched_param = args.sched_param_obj.try_to_libc(vm)?;
@@ -838,7 +853,7 @@ pub mod module {
     ) -> PyResult<()> {
         let path = path.into_cstring(vm)?;
 
-        let argv = vm.extract_elements_func(argv.as_ref(), |obj| {
+        let argv = vm.extract_elements_with(argv.as_ref(), |obj| {
             PyStrRef::try_from_object(vm, obj)?.to_cstring(vm)
         })?;
         let argv: Vec<&CStr> = argv.iter().map(|entry| entry.as_c_str()).collect();
@@ -866,7 +881,7 @@ pub mod module {
     ) -> PyResult<()> {
         let path = path.into_cstring(vm)?;
 
-        let argv = vm.extract_elements_func(argv.as_ref(), |obj| {
+        let argv = vm.extract_elements_with(argv.as_ref(), |obj| {
             PyStrRef::try_from_object(vm, obj)?.to_cstring(vm)
         })?;
         let argv: Vec<&CStr> = argv.iter().map(|entry| entry.as_c_str()).collect();
@@ -1210,11 +1225,11 @@ pub mod module {
 
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
     fn envp_from_dict(
-        env: crate::protocol::PyMapping,
+        env: crate::function::ArgMapping,
         vm: &VirtualMachine,
     ) -> PyResult<Vec<CString>> {
-        let keys = env.keys(vm)?;
-        let values = env.values(vm)?;
+        let keys = env.mapping().keys(vm)?;
+        let values = env.mapping().values(vm)?;
 
         let keys = PyListRef::try_from_object(vm, keys)
             .map_err(|_| vm.new_type_error("env.keys() is not a list".to_owned()))?
@@ -1261,7 +1276,7 @@ pub mod module {
         #[pyarg(positional)]
         args: crate::function::ArgIterable<PyPathLike>,
         #[pyarg(positional)]
-        env: crate::protocol::PyMapping,
+        env: crate::function::ArgMapping,
         #[pyarg(named, default)]
         file_actions: Option<crate::function::ArgIterable<PyTupleRef>>,
         #[pyarg(named, default)]
@@ -1296,7 +1311,7 @@ pub mod module {
             if let Some(it) = self.file_actions {
                 for action in it.iter(vm)? {
                     let action = action?;
-                    let (id, args) = action.as_slice().split_first().ok_or_else(|| {
+                    let (id, args) = action.split_first().ok_or_else(|| {
                         vm.new_type_error(
                             "Each file_actions element must be a non-empty tuple".to_owned(),
                         )
@@ -1892,7 +1907,7 @@ pub mod module {
     struct SendFileArgs {
         out_fd: i32,
         in_fd: i32,
-        offset: crate::crt_fd::Offset,
+        offset: crate::common::crt_fd::Offset,
         count: i64,
         #[cfg(target_os = "macos")]
         #[pyarg(any, optional)]
@@ -1927,18 +1942,13 @@ pub mod module {
         x: OptionalArg,
         vm: &VirtualMachine,
     ) -> PyResult<Option<Vec<crate::function::ArgBytesLike>>> {
-        let inner = match x.into_option() {
-            Some(v) => {
-                let v = vm.extract_elements::<crate::function::ArgBytesLike>(&v)?;
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v)
-                }
-            }
-            None => None,
-        };
-        Ok(inner)
+        x.into_option()
+            .map(|x| {
+                let v: Vec<crate::function::ArgBytesLike> = x.try_to_value(vm)?;
+                Ok(if v.is_empty() { None } else { Some(v) })
+            })
+            .transpose()
+            .map(Option::flatten)
     }
 
     #[cfg(target_os = "macos")]
@@ -1981,13 +1991,18 @@ pub mod module {
     }
 
     #[cfg(target_os = "linux")]
+    unsafe fn sys_getrandom(buf: *mut libc::c_void, buflen: usize, flags: u32) -> isize {
+        libc::syscall(libc::SYS_getrandom, buf, buflen, flags as usize) as _
+    }
+
+    #[cfg(target_os = "linux")]
     #[pyfunction]
     fn getrandom(size: isize, flags: OptionalArg<u32>, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
         let size = usize::try_from(size)
             .map_err(|_| vm.new_os_error(format!("Invalid argument for size: {}", size)))?;
         let mut buf = Vec::with_capacity(size);
         unsafe {
-            let len = libc::getrandom(
+            let len = sys_getrandom(
                 buf.as_mut_ptr() as *mut libc::c_void,
                 size,
                 flags.unwrap_or(0),

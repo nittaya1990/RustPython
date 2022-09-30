@@ -1,24 +1,37 @@
 //! Implementation of the _thread module
-#[cfg_attr(target_os = "wasi", allow(unused_imports))]
+#[cfg_attr(target_arch = "wasm32", allow(unused_imports))]
 pub(crate) use _thread::{make_module, RawRMutex};
 
 #[pymodule]
 pub(crate) mod _thread {
     use crate::{
         builtins::{PyDictRef, PyStrRef, PyTupleRef, PyTypeRef},
-        function::{ArgCallable, FuncArgs, IntoPyException, KwArgs, OptionalArg},
-        py_io,
+        convert::ToPyException,
+        function::{ArgCallable, Either, FuncArgs, KwArgs, OptionalArg, PySetterValue},
         types::{Constructor, GetAttr, SetAttr},
-        utils::Either,
-        IdProtocol, ItemProtocol, PyObjectRef, PyRef, PyResult, PyValue, TypeProtocol,
-        VirtualMachine,
+        AsObject, Py, PyPayload, PyRef, PyResult, VirtualMachine,
     };
     use parking_lot::{
         lock_api::{RawMutex as RawMutexT, RawMutexTimed, RawReentrantMutex},
         RawMutex, RawThreadId,
     };
-    use std::{cell::RefCell, fmt, io::Write, thread, time::Duration};
+    use std::{cell::RefCell, fmt, thread, time::Duration};
     use thread_local::ThreadLocal;
+
+    // PYTHREAD_NAME: show current thread name
+    pub const PYTHREAD_NAME: Option<&str> = {
+        cfg_if::cfg_if! {
+            if #[cfg(windows)] {
+                Some("nt")
+            } else if #[cfg(unix)] {
+                Some("pthread")
+            } else if #[cfg(any(target_os = "solaris", target_os = "illumos"))] {
+                Some("solaris")
+            } else {
+                None
+            }
+        }
+    };
 
     // TIMEOUT_MAX_IN_MICROSECONDS is a value in microseconds
     #[cfg(not(target_os = "windows"))]
@@ -33,7 +46,7 @@ pub(crate) mod _thread {
 
     #[pyattr]
     fn error(vm: &VirtualMachine) -> PyTypeRef {
-        vm.ctx.exceptions.runtime_error.clone()
+        vm.ctx.exceptions.runtime_error.to_owned()
     }
 
     #[derive(FromArgs)]
@@ -95,7 +108,7 @@ pub(crate) mod _thread {
 
     #[pyattr(name = "LockType")]
     #[pyclass(module = "thread", name = "lock")]
-    #[derive(PyValue)]
+    #[derive(PyPayload)]
     struct Lock {
         mu: RawMutex,
     }
@@ -106,12 +119,11 @@ pub(crate) mod _thread {
         }
     }
 
-    #[pyimpl(with(Constructor))]
+    #[pyclass(with(Constructor))]
     impl Lock {
         #[pymethod]
         #[pymethod(name = "acquire_lock")]
         #[pymethod(name = "__enter__")]
-        #[allow(clippy::float_cmp, clippy::match_bool)]
         fn acquire(&self, args: AcquireArgs, vm: &VirtualMachine) -> PyResult<bool> {
             acquire_lock_impl!(&self.mu, args, vm)
         }
@@ -151,7 +163,7 @@ pub(crate) mod _thread {
     pub type RawRMutex = RawReentrantMutex<RawMutex, RawThreadId>;
     #[pyattr]
     #[pyclass(module = "thread", name = "RLock")]
-    #[derive(PyValue)]
+    #[derive(PyPayload)]
     struct RLock {
         mu: RawRMutex,
     }
@@ -162,20 +174,20 @@ pub(crate) mod _thread {
         }
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl RLock {
         #[pyslot]
         fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             RLock {
                 mu: RawRMutex::INIT,
             }
-            .into_pyresult_with_type(vm, cls)
+            .into_ref_with_type(vm, cls)
+            .map(Into::into)
         }
 
         #[pymethod]
         #[pymethod(name = "acquire_lock")]
         #[pymethod(name = "__enter__")]
-        #[allow(clippy::float_cmp, clippy::match_bool)]
         fn acquire(&self, args: AcquireArgs, vm: &VirtualMachine) -> PyResult<bool> {
             acquire_lock_impl!(&self.mu, args, vm)
         }
@@ -211,9 +223,26 @@ pub(crate) mod _thread {
     }
 
     fn thread_to_id(t: &thread::Thread) -> u64 {
+        use std::hash::{Hash, Hasher};
+        struct U64Hash {
+            v: Option<u64>,
+        }
+        impl Hasher for U64Hash {
+            fn write(&mut self, _: &[u8]) {
+                unreachable!()
+            }
+            fn write_u64(&mut self, i: u64) {
+                self.v = Some(i);
+            }
+            fn finish(&self) -> u64 {
+                self.v.expect("should have written a u64")
+            }
+        }
         // TODO: use id.as_u64() once it's stable, until then, ThreadId is just a wrapper
-        // around NonZeroU64, so this is safe
-        unsafe { std::mem::transmute(t.id()) }
+        // around NonZeroU64, so this should work (?)
+        let mut h = U64Hash { v: None };
+        t.id().hash(&mut h);
+        h.finish()
     }
 
     #[pyfunction]
@@ -229,10 +258,11 @@ pub(crate) mod _thread {
         vm: &VirtualMachine,
     ) -> PyResult<u64> {
         let args = FuncArgs::new(
-            args.as_slice().to_owned(),
+            args.to_vec(),
             kwargs
-                .map_or_else(Default::default, |k| k.to_attributes())
+                .map_or_else(Default::default, |k| k.to_attributes(vm))
                 .into_iter()
+                .map(|(k, v)| (k.as_str().to_owned(), v))
                 .collect::<KwArgs>(),
         );
         let mut thread_builder = thread::Builder::new();
@@ -249,24 +279,19 @@ pub(crate) mod _thread {
                 vm.state.thread_count.fetch_add(1);
                 thread_to_id(handle.thread())
             })
-            .map_err(|err| err.into_pyexception(vm))
+            .map_err(|err| err.to_pyexception(vm))
     }
 
     fn run_thread(func: ArgCallable, args: FuncArgs, vm: &VirtualMachine) {
         match func.invoke(args, vm) {
             Ok(_obj) => {}
-            Err(e) if e.isinstance(&vm.ctx.exceptions.system_exit) => {}
+            Err(e) if e.fast_isinstance(vm.ctx.exceptions.system_exit) => {}
             Err(exc) => {
-                // TODO: sys.unraisablehook
-                let stderr = std::io::stderr();
-                let mut stderr = py_io::IoWriter(stderr.lock());
-                let repr = func.as_ref().repr(vm).ok();
-                let repr = repr
-                    .as_ref()
-                    .map_or("<object repr() failed>", |s| s.as_str());
-                writeln!(*stderr, "Exception ignored in thread started by: {}", repr)
-                    .and_then(|()| vm.write_exception(&mut stderr, &exc))
-                    .ok();
+                vm.run_unraisable(
+                    exc,
+                    Some("Exception ignored in thread started by".to_owned()),
+                    func.into(),
+                );
             }
         }
         SENTINELS.with(|sents| {
@@ -279,9 +304,15 @@ pub(crate) mod _thread {
         vm.state.thread_count.fetch_sub(1);
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    #[pyfunction]
+    fn interrupt_main(signum: OptionalArg<i32>, vm: &VirtualMachine) -> PyResult<()> {
+        crate::signal::set_interrupt_ex(signum.unwrap_or(libc::SIGINT), vm)
+    }
+
     #[pyfunction]
     fn exit(vm: &VirtualMachine) -> PyResult {
-        Err(vm.new_exception_empty(vm.ctx.exceptions.system_exit.clone()))
+        Err(vm.new_exception_empty(vm.ctx.exceptions.system_exit.to_owned()))
     }
 
     thread_local!(static SENTINELS: RefCell<Vec<PyRef<Lock>>> = RefCell::default());
@@ -307,12 +338,12 @@ pub(crate) mod _thread {
 
     #[pyattr]
     #[pyclass(module = "thread", name = "_local")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct Local {
         data: ThreadLocal<PyDictRef>,
     }
 
-    #[pyimpl(with(GetAttr, SetAttr), flags(BASETYPE))]
+    #[pyclass(with(GetAttr, SetAttr), flags(BASETYPE))]
     impl Local {
         fn ldict(&self, vm: &VirtualMachine) -> PyDictRef {
             self.data.get_or(|| vm.ctx.new_dict()).clone()
@@ -323,21 +354,23 @@ pub(crate) mod _thread {
             Local {
                 data: ThreadLocal::new(),
             }
-            .into_pyresult_with_type(vm, cls)
+            .into_ref_with_type(vm, cls)
+            .map(Into::into)
         }
     }
 
     impl GetAttr for Local {
-        fn getattro(zelf: PyRef<Self>, attr: PyStrRef, vm: &VirtualMachine) -> PyResult {
+        fn getattro(zelf: &Py<Self>, attr: PyStrRef, vm: &VirtualMachine) -> PyResult {
             let ldict = zelf.ldict(vm);
             if attr.as_str() == "__dict__" {
                 Ok(ldict.into())
             } else {
-                vm.generic_getattribute_opt(zelf.clone().into(), attr.clone(), Some(ldict))?
+                zelf.as_object()
+                    .generic_getattr_opt(attr.clone(), Some(ldict), vm)?
                     .ok_or_else(|| {
                         vm.new_attribute_error(format!(
                             "{} has no attribute '{}'",
-                            zelf.as_object(),
+                            zelf.class().name(),
                             attr
                         ))
                     })
@@ -347,22 +380,22 @@ pub(crate) mod _thread {
 
     impl SetAttr for Local {
         fn setattro(
-            zelf: &crate::PyObjectView<Self>,
+            zelf: &crate::Py<Self>,
             attr: PyStrRef,
-            value: Option<PyObjectRef>,
+            value: PySetterValue,
             vm: &VirtualMachine,
         ) -> PyResult<()> {
             if attr.as_str() == "__dict__" {
                 Err(vm.new_attribute_error(format!(
                     "{} attribute '__dict__' is read-only",
-                    zelf.as_object()
+                    zelf.class().name()
                 )))
             } else {
                 let dict = zelf.ldict(vm);
-                if let Some(value) = value {
-                    dict.set_item(attr, value, vm)?;
+                if let PySetterValue::Assign(value) = value {
+                    dict.set_item(&*attr, value, vm)?;
                 } else {
-                    dict.del_item(attr, vm)?;
+                    dict.del_item(&*attr, vm)?;
                 }
                 Ok(())
             }

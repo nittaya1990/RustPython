@@ -1,11 +1,11 @@
-use super::PyTypeRef;
+use super::{PyType, PyTypeRef};
 use crate::{
     builtins::PyTupleRef,
-    function::{ArgIntoBool, IntoPyObject, OptionalArg, PosArgs},
+    class::PyClassImpl,
+    function::{ArgIntoBool, OptionalArg, PosArgs},
     protocol::{PyIter, PyIterReturn},
     types::{Constructor, IterNext, IterNextIterable},
-    PyClassImpl, PyContext, PyObjectRef, PyRef, PyResult, PyValue, TryFromObject, TypeProtocol,
-    VirtualMachine,
+    AsObject, Context, Py, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
 };
 use rustpython_common::atomic::{self, PyAtomic, Radium};
 
@@ -16,9 +16,9 @@ pub struct PyZip {
     strict: PyAtomic<bool>,
 }
 
-impl PyValue for PyZip {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.zip_type
+impl PyPayload for PyZip {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.zip_type
     }
 }
 
@@ -34,15 +34,17 @@ impl Constructor for PyZip {
     fn py_new(cls: PyTypeRef, (iterators, args): Self::Args, vm: &VirtualMachine) -> PyResult {
         let iterators = iterators.into_vec();
         let strict = Radium::new(args.strict.unwrap_or(false));
-        PyZip { iterators, strict }.into_pyresult_with_type(vm, cls)
+        PyZip { iterators, strict }
+            .into_ref_with_type(vm, cls)
+            .map(Into::into)
     }
 }
 
-#[pyimpl(with(IterNext, Constructor), flags(BASETYPE))]
+#[pyclass(with(IterNext, Constructor), flags(BASETYPE))]
 impl PyZip {
     #[pymethod(magic)]
     fn reduce(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<PyTupleRef> {
-        let cls = zelf.clone_class().into_pyobject(vm);
+        let cls = zelf.class().clone();
         let iterators = zelf
             .iterators
             .iter()
@@ -59,7 +61,7 @@ impl PyZip {
     #[pymethod(magic)]
     fn setstate(zelf: PyRef<Self>, state: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
         if let Ok(obj) = ArgIntoBool::try_from_object(vm, state) {
-            zelf.strict.store(obj.to_bool(), atomic::Ordering::Release);
+            zelf.strict.store(obj.into(), atomic::Ordering::Release);
         }
         Ok(())
     }
@@ -67,7 +69,7 @@ impl PyZip {
 
 impl IterNextIterable for PyZip {}
 impl IterNext for PyZip {
-    fn next(zelf: &crate::PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+    fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         if zelf.iterators.is_empty() {
             return Ok(PyIterReturn::StopIteration(None));
         }
@@ -107,6 +109,6 @@ impl IterNext for PyZip {
     }
 }
 
-pub fn init(context: &PyContext) {
-    PyZip::extend_class(context, &context.types.zip_type);
+pub fn init(ctx: &Context) {
+    PyZip::extend_class(ctx, ctx.types.zip_type);
 }

@@ -1,13 +1,13 @@
-use criterion::measurement::WallTime;
 use criterion::{
-    criterion_group, criterion_main, BatchSize, BenchmarkGroup, BenchmarkId, Criterion, Throughput,
+    criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup, BenchmarkId,
+    Criterion, Throughput,
 };
 use rustpython_compiler::Mode;
-use rustpython_vm::{
-    common::ascii, InitParameter, Interpreter, ItemProtocol, PyObjectWrap, PyResult, PySettings,
+use rustpython_vm::{AsObject, Interpreter, PyResult, Settings};
+use std::{
+    ffi, fs, io,
+    path::{Path, PathBuf},
 };
-use std::path::{Path, PathBuf};
-use std::{ffi, fs, io};
 
 pub struct MicroBenchmark {
     name: String,
@@ -109,16 +109,15 @@ fn cpy_run_code(
 }
 
 fn bench_rustpy_code(group: &mut BenchmarkGroup<WallTime>, bench: &MicroBenchmark) {
-    let mut settings = PySettings::default();
+    let mut settings = Settings::default();
     settings.path_list.push("Lib/".to_string());
     settings.dont_write_bytecode = true;
     settings.no_user_site = true;
 
-    Interpreter::new_with_init(settings, |vm| {
+    Interpreter::with_init(settings, |vm| {
         for (name, init) in rustpython_stdlib::get_module_inits().into_iter() {
             vm.add_native_module(name, init);
         }
-        InitParameter::External
     })
     .enter(|vm| {
         let setup_code = vm
@@ -139,7 +138,7 @@ fn bench_rustpy_code(group: &mut BenchmarkGroup<WallTime>, bench: &MicroBenchmar
                 scope
                     .locals
                     .as_object()
-                    .set_item(vm.new_pyobj(ascii!("ITERATIONS")), vm.new_pyobj(idx), vm)
+                    .set_item("ITERATIONS", vm.new_pyobj(idx), vm)
                     .expect("Error adding ITERATIONS local variable");
             }
             let setup_result = vm.run_code_obj(setup_code.clone(), scope.clone());

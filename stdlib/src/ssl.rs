@@ -26,20 +26,20 @@ mod _ssl {
     use crate::{
         common::{
             ascii,
-            lock::{PyRwLock, PyRwLockWriteGuard},
+            lock::{PyMutex, PyRwLock, PyRwLockWriteGuard},
         },
         socket::{self, PySocket},
         vm::{
             builtins::{PyBaseExceptionRef, PyStrRef, PyType, PyTypeRef, PyWeak},
+            convert::{ToPyException, ToPyObject},
             exceptions,
             function::{
-                ArgBytesLike, ArgCallable, ArgMemoryBuffer, ArgStrOrBytesLike, IntoPyException,
-                IntoPyObject, OptionalArg,
+                ArgBytesLike, ArgCallable, ArgMemoryBuffer, ArgStrOrBytesLike, Either, OptionalArg,
             },
             stdlib::os::PyPathLike,
             types::Constructor,
-            utils::{Either, ToCString},
-            ItemProtocol, PyObjectRef, PyRef, PyResult, PyValue, VirtualMachine,
+            utils::ToCString,
+            PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
         },
     };
     use crossbeam_utils::atomic::AtomicCell;
@@ -180,7 +180,7 @@ mod _ssl {
         vm.ctx.new_exception_type(
             "ssl",
             "SSLError",
-            Some(vec![vm.ctx.exceptions.os_error.clone()]),
+            Some(vec![vm.ctx.exceptions.os_error.to_owned()]),
         )
     }
 
@@ -190,7 +190,10 @@ mod _ssl {
         vm.ctx.new_exception_type(
             "ssl",
             "SSLCertVerificationError",
-            Some(vec![ssl_error(vm), vm.ctx.exceptions.value_error.clone()]),
+            Some(vec![
+                ssl_error(vm),
+                vm.ctx.exceptions.value_error.to_owned(),
+            ]),
         )
     }
 
@@ -415,11 +418,12 @@ mod _ssl {
 
     #[pyattr]
     #[pyclass(module = "ssl", name = "_SSLContext")]
-    #[derive(PyValue)]
+    #[derive(PyPayload)]
     struct PySslContext {
         ctx: PyRwLock<SslContextBuilder>,
         check_hostname: AtomicCell<bool>,
         protocol: SslVersion,
+        post_handshake_auth: PyMutex<bool>,
     }
 
     impl fmt::Debug for PySslContext {
@@ -488,12 +492,14 @@ mod _ssl {
                 ctx: PyRwLock::new(builder),
                 check_hostname: AtomicCell::new(check_hostname),
                 protocol: proto,
+                post_handshake_auth: PyMutex::new(false),
             }
-            .into_pyresult_with_type(vm, cls)
+            .into_ref_with_type(vm, cls)
+            .map(Into::into)
         }
     }
 
-    #[pyimpl(flags(BASETYPE), with(Constructor))]
+    #[pyclass(flags(BASETYPE), with(Constructor))]
     impl PySslContext {
         fn builder(&self) -> PyRwLockWriteGuard<'_, SslContextBuilder> {
             self.ctx.write()
@@ -504,6 +510,22 @@ mod _ssl {
         {
             let c = self.ctx.read();
             func(builder_as_ctx(&c))
+        }
+
+        #[pygetset]
+        fn post_handshake_auth(&self) -> bool {
+            *self.post_handshake_auth.lock()
+        }
+        #[pygetset(setter)]
+        fn set_post_handshake_auth(
+            &self,
+            value: Option<PyObjectRef>,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            let value = value
+                .ok_or_else(|| vm.new_attribute_error("cannot delete attribute".to_owned()))?;
+            *self.post_handshake_auth.lock() = value.is_true(vm)?;
+            Ok(())
         }
 
         #[pymethod]
@@ -517,20 +539,20 @@ mod _ssl {
             })
         }
 
-        #[pyproperty]
+        #[pygetset]
         fn options(&self) -> libc::c_ulong {
             self.ctx.read().options().bits()
         }
-        #[pyproperty(setter)]
+        #[pygetset(setter)]
         fn set_options(&self, opts: libc::c_ulong) {
             self.builder()
                 .set_options(SslOptions::from_bits_truncate(opts));
         }
-        #[pyproperty]
+        #[pygetset]
         fn protocol(&self) -> i32 {
             self.protocol as i32
         }
-        #[pyproperty]
+        #[pygetset]
         fn verify_mode(&self) -> i32 {
             let mode = self.exec_ctx(|ctx| ctx.verify_mode());
             if mode == SslVerifyMode::NONE {
@@ -543,7 +565,7 @@ mod _ssl {
                 unreachable!()
             }
         }
-        #[pyproperty(setter)]
+        #[pygetset(setter)]
         fn set_verify_mode(&self, cert: i32, vm: &VirtualMachine) -> PyResult<()> {
             let mut ctx = self.builder();
             let cert_req = CertRequirements::try_from(cert)
@@ -564,11 +586,11 @@ mod _ssl {
             ctx.set_verify(mode);
             Ok(())
         }
-        #[pyproperty]
+        #[pygetset]
         fn check_hostname(&self) -> bool {
             self.check_hostname.load()
         }
-        #[pyproperty(setter)]
+        #[pygetset(setter)]
         fn set_check_hostname(&self, ch: bool) {
             let mut ctx = self.builder();
             if ch && builder_as_ctx(&ctx).verify_mode() == SslVerifyMode::NONE {
@@ -773,7 +795,7 @@ mod _ssl {
                 stream: PyRwLock::new(stream),
                 socket_type,
                 server_hostname: args.server_hostname,
-                owner: PyRwLock::new(args.owner.as_ref().map(|o| PyWeak::downgrade(o))),
+                owner: PyRwLock::new(args.owner.map(|o| o.downgrade(None, vm)).transpose()?),
             })
         }
     }
@@ -884,13 +906,13 @@ mod _ssl {
 
     #[pyattr]
     #[pyclass(module = "ssl", name = "_SSLSocket")]
-    #[derive(PyValue)]
+    #[derive(PyPayload)]
     struct PySslSocket {
         ctx: PyRef<PySslContext>,
         stream: PyRwLock<ssl::SslStream<SocketStream>>,
         socket_type: SslServerOrClient,
         server_hostname: Option<PyStrRef>,
-        owner: PyRwLock<Option<PyWeak>>,
+        owner: PyRwLock<Option<PyRef<PyWeak>>>,
     }
 
     impl fmt::Debug for PySslSocket {
@@ -899,25 +921,28 @@ mod _ssl {
         }
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl PySslSocket {
-        #[pyproperty]
+        #[pygetset]
         fn owner(&self) -> Option<PyObjectRef> {
-            self.owner.read().as_ref().and_then(PyWeak::upgrade)
+            self.owner.read().as_ref().and_then(|weak| weak.upgrade())
         }
-        #[pyproperty(setter)]
-        fn set_owner(&self, owner: PyObjectRef) {
-            *self.owner.write() = Some(PyWeak::downgrade(&owner))
+        #[pygetset(setter)]
+        fn set_owner(&self, owner: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+            let mut lock = self.owner.write();
+            lock.take();
+            *lock = Some(owner.downgrade(None, vm)?);
+            Ok(())
         }
-        #[pyproperty]
+        #[pygetset]
         fn server_side(&self) -> bool {
             self.socket_type == SslServerOrClient::Server
         }
-        #[pyproperty]
+        #[pygetset]
         fn context(&self) -> PyRef<PySslContext> {
             self.ctx.clone()
         }
-        #[pyproperty]
+        #[pygetset]
         fn server_hostname(&self) -> Option<PyStrRef> {
             self.server_hostname.clone()
         }
@@ -1125,10 +1150,17 @@ mod _ssl {
                 // TODO: map the error codes to code names, e.g. "CERTIFICATE_VERIFY_FAILED", just requires a big hashmap/dict
                 let errstr = e.reason().unwrap_or("unknown error");
                 let msg = if let Some(lib) = e.library() {
+                    // add `library` attribute
+                    let attr_name = vm.ctx.as_ref().intern_str("library");
+                    cls.set_attr(attr_name, vm.ctx.new_str(lib).into());
                     format!("[{}] {} ({}:{})", lib, errstr, file, line)
                 } else {
                     format!("{} ({}:{})", errstr, file, line)
                 };
+                // add `reason` attribute
+                let attr_name = vm.ctx.as_ref().intern_str("reason");
+                cls.set_attr(attr_name, vm.ctx.new_str(errstr).into());
+
                 let reason = sys::ERR_GET_REASON(e.code());
                 vm.new_exception(
                     cls,
@@ -1154,7 +1186,7 @@ mod _ssl {
                 "The operation did not complete (write)",
             ),
             ssl::ErrorCode::SYSCALL => match e.io_error() {
-                Some(io_err) => return io_err.into_pyexception(vm),
+                Some(io_err) => return io_err.to_pyexception(vm),
                 None => (
                     vm.class("_ssl", "SSLSyscallError"),
                     "EOF occurred in violation of protocol",
@@ -1213,7 +1245,7 @@ mod _ssl {
                 let list = name
                     .entries()
                     .map(|entry| {
-                        let txt = obj2txt(entry.object(), false).into_pyobject(vm);
+                        let txt = obj2txt(entry.object(), false).to_pyobject(vm);
                         let data = vm.ctx.new_str(entry.data().as_utf8()?.to_owned());
                         Ok(vm.new_tuple(((txt, data),)).into())
                     })
@@ -1282,7 +1314,7 @@ mod _ssl {
 
     #[pyfunction]
     fn _test_decode_cert(path: PyPathLike, vm: &VirtualMachine) -> PyResult {
-        let pem = std::fs::read(&path).map_err(|e| e.into_pyexception(vm))?;
+        let pem = std::fs::read(&path).map_err(|e| e.to_pyexception(vm))?;
         let x509 = X509::from_pem(&pem).map_err(|e| convert_openssl_error(vm, e))?;
         cert_to_py(vm, &x509, false)
     }
@@ -1307,9 +1339,8 @@ mod _ssl {
 
     #[cfg(target_os = "android")]
     mod android {
-        use crate::{
-            exceptions::PyBaseExceptionRef, stdlib::ssl::convert_openssl_error, VirtualMachine,
-        };
+        use super::convert_openssl_error;
+        use crate::vm::{builtins::PyBaseExceptionRef, VirtualMachine};
         use openssl::{
             ssl::SslContextBuilder,
             x509::{store::X509StoreBuilder, X509},
@@ -1397,8 +1428,8 @@ mod windows {
         common::ascii,
         vm::{
             builtins::{PyFrozenSet, PyStrRef},
-            function::IntoPyException,
-            PyObjectRef, PyResult, PyValue, VirtualMachine,
+            convert::ToPyException,
+            PyObjectRef, PyPayload, PyResult, VirtualMachine,
         },
     };
 
@@ -1439,7 +1470,7 @@ mod windows {
         });
         let certs = certs
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e: std::io::Error| e.into_pyexception(vm))?;
+            .map_err(|e: std::io::Error| e.to_pyexception(vm))?;
         Ok(certs)
     }
 }

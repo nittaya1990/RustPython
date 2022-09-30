@@ -16,12 +16,15 @@ import unittest.mock
 from weakref import proxy
 import contextlib
 
+from test.support import import_helper
+from test.support import threading_helper
+
 import functools
 
-py_functools = support.import_fresh_module('functools', blocked=['_functools'])
-c_functools = support.import_fresh_module('functools', fresh=['_functools'])
+py_functools = import_helper.import_fresh_module('functools', blocked=['_functools'])
+c_functools = import_helper.import_fresh_module('functools', fresh=['_functools'])
 
-decimal = support.import_fresh_module('decimal', fresh=['_decimal'])
+decimal = import_helper.import_fresh_module('decimal', fresh=['_decimal'])
 
 @contextlib.contextmanager
 def replaced_module(name, replacement):
@@ -269,8 +272,6 @@ class TestPartial:
         self.assertIsNot(f_copy.keywords, f.keywords)
         self.assertIsNot(f_copy.keywords['bar'], f.keywords['bar'])
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_setstate(self):
         f = self.partial(signature)
         f.__setstate__((capture, (1,), dict(a=10), dict(attr=[])))
@@ -306,8 +307,6 @@ class TestPartial:
         self.assertRaises(TypeError, f.__setstate__, (capture, [], {}, None))
         self.assertRaises(TypeError, f.__setstate__, (capture, (), [], None))
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_setstate_subclasses(self):
         f = self.partial(signature)
         f.__setstate__((capture, MyTuple((1,)), MyDict(a=10), None))
@@ -328,7 +327,6 @@ class TestPartial:
         self.assertEqual(r, ((1, 2), {}))
         self.assertIs(type(r[0]), tuple)
 
-    @unittest.skipIf(sys.platform == "win32", "TODO: RUSTPYTHON, thread 'main' has overflowed its stack on Windows")
     def test_recursive_pickle(self):
         with self.AllowPickle():
             f = self.partial(capture)
@@ -500,8 +498,6 @@ class TestPartialMethod(unittest.TestCase):
 
     a = A()
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_arg_combinations(self):
         self.assertEqual(self.a.nothing(), ((self.a,), {}))
         self.assertEqual(self.a.nothing(5), ((self.a, 5), {}))
@@ -1571,7 +1567,7 @@ class TestLRU:
             # create n threads in order to fill cache
             threads = [threading.Thread(target=full, args=[k])
                        for k in range(n)]
-            with support.start_threads(threads):
+            with threading_helper.start_threads(threads):
                 start.set()
 
             hits, misses, maxsize, currsize = f.cache_info()
@@ -1589,7 +1585,7 @@ class TestLRU:
             threads += [threading.Thread(target=full, args=[k])
                         for k in range(n)]
             start.clear()
-            with support.start_threads(threads):
+            with threading_helper.start_threads(threads):
                 start.set()
         finally:
             sys.setswitchinterval(orig_si)
@@ -1611,7 +1607,7 @@ class TestLRU:
                 self.assertEqual(f(i), 3 * i)
                 stop.wait(10)
         threads = [threading.Thread(target=test) for k in range(n)]
-        with support.start_threads(threads):
+        with threading_helper.start_threads(threads):
             for i in range(m):
                 start.wait(10)
                 stop.reset()
@@ -1631,7 +1627,7 @@ class TestLRU:
                 self.assertEqual(f(x), 3 * x, i)
         threads = [threading.Thread(target=test, args=(i, v))
                    for i, v in enumerate([1, 2, 2, 3, 2])]
-        with support.start_threads(threads):
+        with threading_helper.start_threads(threads):
             pass
 
     def test_need_for_rlock(self):
@@ -2527,7 +2523,7 @@ class TestCachedProperty(unittest.TestCase):
                 threading.Thread(target=lambda: item.cost)
                 for k in range(num_threads)
             ]
-            with support.start_threads(threads):
+            with threading_helper.start_threads(threads):
                 go.set()
         finally:
             sys.setswitchinterval(orig_si)

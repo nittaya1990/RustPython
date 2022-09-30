@@ -1,4 +1,6 @@
-use crate::vm::{builtins::PyListRef, PyObjectRef, PyResult, TryFromObject, VirtualMachine};
+use crate::vm::{
+    builtins::PyListRef, PyObject, PyObjectRef, PyResult, TryFromObject, VirtualMachine,
+};
 use std::{io, mem};
 
 pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
@@ -7,7 +9,7 @@ pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
 
     #[cfg(unix)]
     {
-        use crate::vm::PyClassImpl;
+        use crate::vm::class::PyClassImpl;
         decl::poll::PyPoll::make_class(&vm.ctx);
     }
 
@@ -72,10 +74,12 @@ struct Selectable {
 
 impl TryFromObject for Selectable {
     fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
-        let fno = obj.try_borrow_to_object(vm).or_else(|_| {
-            let meth = vm.get_method_or_type_error(obj.clone(), "fileno", || {
-                "select arg must be an int or object with a fileno() method".to_owned()
-            })?;
+        let fno = obj.try_to_value(vm).or_else(|_| {
+            let meth = vm.get_method_or_type_error(
+                obj.clone(),
+                vm.ctx.interned_str("fileno").unwrap(),
+                || "select arg must be an int or object with a fileno() method".to_owned(),
+            )?;
             vm.invoke(&meth, ())?.try_into_value(vm)
         })?;
         Ok(Selectable { obj, fno })
@@ -152,11 +156,17 @@ fn sec_to_timeval(sec: f64) -> timeval {
 mod decl {
     use super::*;
     use crate::vm::{
-        function::{IntoPyException, OptionalOption},
+        builtins::PyTypeRef,
+        convert::ToPyException,
+        function::{Either, OptionalOption},
         stdlib::time,
-        utils::Either,
         PyObjectRef, PyResult, VirtualMachine,
     };
+
+    #[pyattr]
+    fn error(vm: &VirtualMachine) -> PyTypeRef {
+        vm.ctx.exceptions.os_error.to_owned()
+    }
 
     #[pyfunction]
     fn select(
@@ -177,8 +187,8 @@ mod decl {
         }
         let deadline = timeout.map(|s| time::time(vm).unwrap() + s);
 
-        let seq2set = |list| -> PyResult<(Vec<Selectable>, FdSet)> {
-            let v = vm.extract_elements::<Selectable>(list)?;
+        let seq2set = |list: &PyObject| -> PyResult<(Vec<Selectable>, FdSet)> {
+            let v: Vec<Selectable> = list.try_to_value(vm)?;
             let mut fds = FdSet::new();
             for fd in &v {
                 fds.insert(fd.fno);
@@ -208,7 +218,7 @@ mod decl {
             match res {
                 Ok(_) => break,
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                Err(err) => return Err(err.into_pyexception(vm)),
+                Err(err) => return Err(err.to_pyexception(vm)),
             }
 
             vm.check_signals()?;
@@ -255,18 +265,15 @@ mod decl {
     pub(super) mod poll {
         use super::*;
         use crate::vm::{
-            builtins::PyFloat,
-            common::lock::PyMutex,
-            function::{IntoPyObject, OptionalArg},
-            stdlib::io::Fildes,
-            PyValue, TypeProtocol,
+            builtins::PyFloat, common::lock::PyMutex, convert::ToPyObject, function::OptionalArg,
+            stdlib::io::Fildes, AsObject, PyPayload,
         };
         use libc::pollfd;
         use num_traits::ToPrimitive;
         use std::time;
 
         #[pyclass(module = "select", name = "poll")]
-        #[derive(Default, Debug, PyValue)]
+        #[derive(Default, Debug, PyPayload)]
         pub struct PyPoll {
             // keep sorted
             fds: PyMutex<Vec<pollfd>>,
@@ -301,7 +308,7 @@ mod decl {
 
         const DEFAULT_EVENTS: i16 = libc::POLLIN | libc::POLLPRI | libc::POLLOUT;
 
-        #[pyimpl]
+        #[pyclass]
         impl PyPoll {
             #[pymethod]
             fn register(&self, Fildes(fd): Fildes, eventmask: OptionalArg<u16>) {
@@ -313,16 +320,10 @@ mod decl {
             }
 
             #[pymethod]
-            fn modify(
-                &self,
-                Fildes(fd): Fildes,
-                eventmask: u16,
-                vm: &VirtualMachine,
-            ) -> PyResult<()> {
+            fn modify(&self, Fildes(fd): Fildes, eventmask: u16) -> io::Result<()> {
                 let mut fds = self.fds.lock();
-                let pfd = get_fd_mut(&mut fds, fd).ok_or_else(|| {
-                    io::Error::from_raw_os_error(libc::ENOENT).into_pyexception(vm)
-                })?;
+                let pfd = get_fd_mut(&mut fds, fd)
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
                 pfd.events = eventmask as i16;
                 Ok(())
             }
@@ -346,7 +347,7 @@ mod decl {
                     Some(ms) => {
                         let ms = if let Some(float) = ms.payload::<PyFloat>() {
                             float.to_f64().to_i32()
-                        } else if let Some(int) = vm.to_index_opt(ms.clone()) {
+                        } else if let Some(int) = ms.try_index_opt(vm) {
                             int?.as_bigint().to_i32()
                         } else {
                             return Err(vm.new_type_error(format!(
@@ -381,13 +382,13 @@ mod decl {
                                 }
                             }
                         }
-                        Err(e) => return Err(e.into_pyexception(vm)),
+                        Err(e) => return Err(e.to_pyexception(vm)),
                     }
                 }
                 Ok(fds
                     .iter()
                     .filter(|pfd| pfd.revents != 0)
-                    .map(|pfd| (pfd.fd, pfd.revents & 0xfff).into_pyobject(vm))
+                    .map(|pfd| (pfd.fd, pfd.revents & 0xfff).to_pyobject(vm))
                     .collect())
             }
         }

@@ -7,8 +7,8 @@ import os
 import sys
 import unittest
 import warnings
-from test import support
 from test.support import os_helper
+from test.support import warnings_helper
 from test.support.script_helper import assert_python_ok
 from test.support.os_helper import FakePath
 
@@ -186,7 +186,7 @@ class GenericTest:
             self.assertIs(self.pathmodule.isdir(filename), True)
             self.assertIs(self.pathmodule.isdir(bfilename), True)
         finally:
-            support.rmdir(filename)
+            os_helper.rmdir(filename)
 
     def test_isfile(self):
         filename = os_helper.TESTFN
@@ -211,7 +211,7 @@ class GenericTest:
             self.assertIs(self.pathmodule.isfile(filename), False)
             self.assertIs(self.pathmodule.isfile(bfilename), False)
         finally:
-            support.rmdir(filename)
+            os_helper.rmdir(filename)
 
     def test_samefile(self):
         file1 = os_helper.TESTFN
@@ -526,7 +526,7 @@ class CommonTest(GenericTest):
 
     def test_join_errors(self):
         # Check join() raises friendly TypeErrors.
-        with support.check_warnings(('', BytesWarning), quiet=True):
+        with warnings_helper.check_warnings(('', BytesWarning), quiet=True):
             errmsg = "Can't mix strings and bytes in path components"
             with self.assertRaisesRegex(TypeError, errmsg):
                 self.pathmodule.join(b'bytes', 'str')
@@ -546,8 +546,8 @@ class CommonTest(GenericTest):
 
     def test_relpath_errors(self):
         # Check relpath() raises friendly TypeErrors.
-        with support.check_warnings(('', (BytesWarning, DeprecationWarning)),
-                                    quiet=True):
+        with warnings_helper.check_warnings(
+                ('', (BytesWarning, DeprecationWarning)), quiet=True):
             errmsg = "Can't mix strings and bytes in path components"
             with self.assertRaisesRegex(TypeError, errmsg):
                 self.pathmodule.relpath(b'bytes', 'str')
@@ -567,7 +567,7 @@ class CommonTest(GenericTest):
 class PathLikeTests(unittest.TestCase):
 
     def setUp(self):
-        self.file_name = os_helper.TESTFN.lower()
+        self.file_name = os_helper.TESTFN
         self.file_path = FakePath(os_helper.TESTFN)
         self.addCleanup(os_helper.unlink, self.file_name)
         create_file(self.file_name, b"test_genericpath.PathLikeTests")

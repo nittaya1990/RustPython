@@ -10,8 +10,11 @@ import fnmatch
 import fractions
 import itertools
 import locale
-# TODO: RUSTPYTHON
-# import mmap
+# XXX: RUSTPYTHON
+try:
+    import mmap
+except ImportError:
+    pass
 import os
 import pickle
 import select
@@ -24,6 +27,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import textwrap
 import threading
 import time
 import types
@@ -31,13 +35,11 @@ import unittest
 import uuid
 import warnings
 from test import support
-# TODO: RUSTPYTHON
-# from test.support import import_helper
+from test.support import import_helper
 from test.support import os_helper
-# TODO: RUSTPYTHON
-# from test.support import socket_helper
-# from test.support import threading_helper
-# from test.support import warnings_helper
+from test.support import socket_helper
+from test.support import threading_helper
+from test.support import warnings_helper
 from platform import win32_is_iot
 
 with warnings.catch_warnings():
@@ -806,6 +808,8 @@ class UtimeTests(unittest.TestCase):
         # issue, os.utime() rounds towards minus infinity.
         return (ns * 1e-9) + 0.5e-9
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_utime_by_indexed(self):
         # pass times as floating point seconds as the second indexed parameter
         def set_time(filename, ns):
@@ -817,6 +821,8 @@ class UtimeTests(unittest.TestCase):
             os.utime(filename, (atime, mtime))
         self._test_utime(set_time)
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_utime_by_times(self):
         def set_time(filename, ns):
             atime_ns, mtime_ns = ns
@@ -851,12 +857,9 @@ class UtimeTests(unittest.TestCase):
     def test_utime_dir_fd(self):
         def set_time(filename, ns):
             dirname, name = os.path.split(filename)
-            dirfd = os.open(dirname, os.O_RDONLY)
-            try:
+            with os_helper.open_dir_fd(dirname) as dirfd:
                 # pass dir_fd to test utimensat(timespec) or futimesat(timeval)
                 os.utime(name, dir_fd=dirfd, ns=ns)
-            finally:
-                os.close(dirfd)
         self._test_utime(set_time)
 
     def test_utime_directory(self):
@@ -1032,11 +1035,9 @@ class EnvironTests(mapping_tests.BasicTestMappingProtocol):
     def test___repr__(self):
         """Check that the repr() of os.environ looks like environ({...})."""
         env = os.environ
-        formatted_items = ", ".join(
-            f"{key!r}: {value!r}"
-            for key, value in env.items()
-        )
-        self.assertEqual(repr(env), f"environ({{{formatted_items}}})")
+        self.assertEqual(repr(env), 'environ({{{}}})'.format(', '.join(
+            '{!r}: {!r}'.format(key, value)
+            for key, value in env.items())))
 
     def test_get_exec_path(self):
         defpath_list = os.defpath.split(os.pathsep)
@@ -1081,7 +1082,8 @@ class EnvironTests(mapping_tests.BasicTestMappingProtocol):
 
     @unittest.skipUnless(os.supports_bytes_environ,
                          "os.environb required for this test.")
-    # TODO: RUSTPYTHON (KeyError: 'surrogateescape')
+    # TODO: RUSTPYTHON (UnicodeDecodeError: can't decode bytes for utf-8)
+    # Need to fix 'surrogateescape'
     @unittest.expectedFailure
     def test_environb(self):
         # os.environ -> os.environb
@@ -1186,8 +1188,6 @@ class EnvironTests(mapping_tests.BasicTestMappingProtocol):
 
         self.assertEqual(expected, value)
 
-    # TODO: RUSTPYTHON (KeyError: 'surrogateescape')
-    @unittest.expectedFailure
     def test_or_operator(self):
         overridden_key = '_TEST_VAR_'
         original_value = 'original_value'
@@ -1207,8 +1207,6 @@ class EnvironTests(mapping_tests.BasicTestMappingProtocol):
         self._test_underlying_process_env('_A_', '')
         self._test_underlying_process_env(overridden_key, original_value)
 
-    # TODO: RUSTPYTHON (KeyError: 'surrogateescape')
-    @unittest.expectedFailure
     def test_ior_operator(self):
         overridden_key = '_TEST_VAR_'
         os.environ[overridden_key] = 'original_value'
@@ -1237,8 +1235,6 @@ class EnvironTests(mapping_tests.BasicTestMappingProtocol):
         # Check nothing was added.
         self.assertEqual(os_environ_copy, os.environ)
 
-    # TODO: RUSTPYTHON (KeyError: 'surrogateescape')
-    @unittest.expectedFailure
     def test_ior_operator_key_value_iterable(self):
         overridden_key = '_TEST_VAR_'
         os.environ[overridden_key] = 'original_value'
@@ -1254,8 +1250,6 @@ class EnvironTests(mapping_tests.BasicTestMappingProtocol):
         self._test_underlying_process_env('_A_', '1')
         self._test_underlying_process_env(overridden_key, '3')
 
-    # TODO: RUSTPYTHON (KeyError: 'surrogateescape')
-    @unittest.expectedFailure
     def test_ror_operator(self):
         overridden_key = '_TEST_VAR_'
         original_value = 'original_value'
@@ -2852,8 +2846,8 @@ class Win32JunctionTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "win32", "Win32 specific tests")
 class Win32NtTests(unittest.TestCase):
     def test_getfinalpathname_handles(self):
-        nt = support.import_module('nt')
-        ctypes = support.import_module('ctypes')
+        nt = import_helper.import_module('nt')
+        ctypes = import_helper.import_module('ctypes')
         import ctypes.wintypes
 
         kernel = ctypes.WinDLL('Kernel32.dll', use_last_error=True)
@@ -2898,6 +2892,48 @@ class Win32NtTests(unittest.TestCase):
         handle_delta = handle_count.value - before_count
 
         self.assertEqual(0, handle_delta)
+
+    def test_stat_unlink_race(self):
+        # bpo-46785: the implementation of os.stat() falls back to reading
+        # the parent directory if CreateFileW() fails with a permission
+        # error. If reading the parent directory fails because the file or
+        # directory are subsequently unlinked, or because the volume or
+        # share are no longer available, then the original permission error
+        # should not be restored.
+        filename =  os_helper.TESTFN
+        self.addCleanup(os_helper.unlink, filename)
+        deadline = time.time() + 5
+        command = textwrap.dedent("""\
+            import os
+            import sys
+            import time
+
+            filename = sys.argv[1]
+            deadline = float(sys.argv[2])
+
+            while time.time() < deadline:
+                try:
+                    with open(filename, "w") as f:
+                        pass
+                except OSError:
+                    pass
+                try:
+                    os.remove(filename)
+                except OSError:
+                    pass
+            """)
+
+        with subprocess.Popen([sys.executable, '-c', command, filename, str(deadline)]) as proc:
+            while time.time() < deadline:
+                try:
+                    os.stat(filename)
+                except FileNotFoundError as e:
+                    assert e.winerror == 2  # ERROR_FILE_NOT_FOUND
+            try:
+                proc.wait(1)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+
 
 @os_helper.skip_unless_symlink
 class NonLocalSymlinkTests(unittest.TestCase):
@@ -2949,8 +2985,6 @@ class FSEncodingTests(unittest.TestCase):
 
 class DeviceEncodingTests(unittest.TestCase):
 
-    # TODO: RUSTPYTHON (AttributeError: module 'os' has no attribute 'device_encoding')
-    @unittest.expectedFailure
     def test_bad_fd(self):
         # Return None when an fd doesn't actually exist.
         self.assertIsNone(os.device_encoding(123456))
@@ -3353,16 +3387,16 @@ class TestSendfile(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.key = support.threading_setup()
+        cls.key = threading_helper.threading_setup()
         create_file(os_helper.TESTFN, cls.DATA)
 
     @classmethod
     def tearDownClass(cls):
-        support.threading_cleanup(*cls.key)
+        threading_helper.threading_cleanup(*cls.key)
         os_helper.unlink(os_helper.TESTFN)
 
     def setUp(self):
-        self.server = SendfileTestServer((support.HOST, 0))
+        self.server = SendfileTestServer((socket_helper.HOST, 0))
         self.server.start()
         self.client = socket.socket()
         self.client.connect((self.server.host, self.server.port))
@@ -4137,7 +4171,7 @@ class TestDirEntry(unittest.TestCase):
 
 
 class TestScandir(unittest.TestCase):
-    check_no_resource_warning = support.check_no_resource_warning
+    check_no_resource_warning = warnings_helper.check_no_resource_warning
 
     def setUp(self):
         self.path = os.path.realpath(os_helper.TESTFN)
@@ -4401,8 +4435,7 @@ class TestScandir(unittest.TestCase):
             os.symlink('file.txt', os.path.join(self.path, 'link'))
             expected_names.append('link')
 
-        fd = os.open(self.path, os.O_RDONLY)
-        try:
+        with os_helper.open_dir_fd(self.path) as fd:
             with os.scandir(fd) as it:
                 entries = list(it)
             names = [entry.name for entry in entries]
@@ -4417,8 +4450,6 @@ class TestScandir(unittest.TestCase):
                     self.assertEqual(entry.stat(), st)
                     st = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
                     self.assertEqual(entry.stat(follow_symlinks=False), st)
-        finally:
-            os.close(fd)
 
     def test_empty_path(self):
         self.assertRaises(FileNotFoundError, os.scandir, '')
@@ -4545,8 +4576,6 @@ class TestPEP519(unittest.TestCase):
         self.assertFalse(issubclass(FakePath, A))
         self.assertTrue(issubclass(FakePath, os.PathLike))
 
-    # TODO: RUSTPYTHON (TypeError: 'ABCMeta' object is not subscriptable)
-    @unittest.expectedFailure
     def test_pathlike_class_getitem(self):
         self.assertIsInstance(os.PathLike[bytes], types.GenericAlias)
 
@@ -4565,6 +4594,22 @@ class TimesTests(unittest.TestCase):
             self.assertEqual(times.children_user, 0)
             self.assertEqual(times.children_system, 0)
             self.assertEqual(times.elapsed, 0)
+
+
+@requires_os_func('fork')
+class ForkTests(unittest.TestCase):
+    def test_fork(self):
+        # bpo-42540: ensure os.fork() with non-default memory allocator does
+        # not crash on exit.
+        code = """if 1:
+            import os
+            from test import support
+            pid = os.fork()
+            if pid != 0:
+                support.wait_process(pid, exitcode=0)
+        """
+        assert_python_ok("-c", code)
+        assert_python_ok("-c", code, PYTHONMALLOC="malloc_debug")
 
 
 # Only test if the C version is provided, otherwise TestPEP519 already tested

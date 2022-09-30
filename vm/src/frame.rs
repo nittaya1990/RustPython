@@ -4,19 +4,20 @@ use crate::{
         asyncgenerator::PyAsyncGenWrappedValue,
         function::{PyCell, PyCellRef, PyFunction},
         tuple::{PyTuple, PyTupleTyped},
-        PyBaseExceptionRef, PyCode, PyCoroutine, PyDict, PyDictRef, PyGenerator, PyListRef, PySet,
-        PySlice, PyStr, PyStrRef, PyTraceback, PyTypeRef,
+        PyBaseExceptionRef, PyCode, PyCoroutine, PyDict, PyDictRef, PyGenerator, PyList, PySet,
+        PySlice, PyStr, PyStrInterned, PyStrRef, PyTraceback, PyType,
     },
     bytecode,
+    convert::{IntoObject, ToPyResult},
     coroutine::Coro,
     exceptions::ExceptionCtor,
-    function::{FuncArgs, IntoPyResult},
-    protocol::{PyIter, PyIterReturn, PyMapping},
+    format::call_object_format,
+    function::{ArgMapping, Either, FuncArgs},
+    protocol::{PyIter, PyIterReturn},
     scope::Scope,
     stdlib::builtins,
-    types::PyComparisonOp,
-    IdProtocol, ItemProtocol, PyMethod, PyObject, PyObjectRef, PyObjectWrap, PyRef, PyResult,
-    PyValue, TryFromObject, TypeProtocol, VirtualMachine,
+    vm::PyMethod,
+    AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
 };
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -99,7 +100,7 @@ pub struct Frame {
 
     pub fastlocals: PyMutex<Box<[Option<PyObjectRef>]>>,
     pub(crate) cells_frees: Box<[PyCellRef]>,
-    pub locals: PyMapping,
+    pub locals: ArgMapping,
     pub globals: PyDictRef,
     pub builtins: PyDictRef,
 
@@ -112,9 +113,9 @@ pub struct Frame {
     state: PyMutex<FrameState>,
 }
 
-impl PyValue for Frame {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.frame_type
+impl PyPayload for Frame {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.frame_type
     }
 }
 
@@ -141,7 +142,7 @@ impl Frame {
             .collect();
 
         let state = FrameState {
-            stack: BoxVec::new(code.max_stacksize as usize),
+            stack: BoxVec::new(code.max_stackdepth as usize),
             blocks: Vec::new(),
             #[cfg(feature = "threading")]
             lasti: 0,
@@ -179,48 +180,30 @@ impl FrameRef {
         f(exec)
     }
 
-    pub fn locals(&self, vm: &VirtualMachine) -> PyResult<PyMapping> {
+    pub fn locals(&self, vm: &VirtualMachine) -> PyResult<ArgMapping> {
         let locals = &self.locals;
         let code = &**self.code;
         let map = &code.varnames;
         let j = std::cmp::min(map.len(), code.varnames.len());
         if !code.varnames.is_empty() {
             let fastlocals = self.fastlocals.lock();
-            for (k, v) in itertools::zip(&map[..j], &**fastlocals) {
-                if let Some(v) = v {
-                    match locals.as_object().to_owned().downcast_exact::<PyDict>(vm) {
-                        Ok(d) => d.set_item(k.clone(), v.clone(), vm)?,
-                        Err(o) => o.set_item(k.clone(), v.clone(), vm)?,
-                    };
-                } else {
-                    let res = match locals.as_object().to_owned().downcast_exact::<PyDict>(vm) {
-                        Ok(d) => d.del_item(k.clone(), vm),
-                        Err(o) => o.del_item(k.clone(), vm),
-                    };
-                    match res {
-                        Ok(()) => {}
-                        Err(e) if e.isinstance(&vm.ctx.exceptions.key_error) => {}
-                        Err(e) => return Err(e),
-                    }
+            for (&k, v) in itertools::zip(&map[..j], &**fastlocals) {
+                match locals.mapping().ass_subscript(k, v.clone(), vm) {
+                    Ok(()) => {}
+                    Err(e) if e.fast_isinstance(vm.ctx.exceptions.key_error) => {}
+                    Err(e) => return Err(e),
                 }
             }
         }
         if !code.cellvars.is_empty() || !code.freevars.is_empty() {
-            let map_to_dict = |keys: &[PyStrRef], values: &[PyCellRef]| {
-                for (k, v) in itertools::zip(keys, values) {
-                    if let Some(v) = v.get() {
-                        match locals.as_object().to_owned().downcast_exact::<PyDict>(vm) {
-                            Ok(d) => d.set_item(k.clone(), v, vm)?,
-                            Err(o) => o.set_item(k.clone(), v, vm)?,
-                        };
+            let map_to_dict = |keys: &[&PyStrInterned], values: &[PyCellRef]| {
+                for (&k, v) in itertools::zip(keys, values) {
+                    if let Some(value) = v.get() {
+                        locals.mapping().ass_subscript(k, Some(value), vm)?;
                     } else {
-                        let res = match locals.as_object().to_owned().downcast_exact::<PyDict>(vm) {
-                            Ok(d) => d.del_item(k.clone(), vm),
-                            Err(o) => o.del_item(k.clone(), vm),
-                        };
-                        match res {
+                        match locals.mapping().ass_subscript(k, None, vm) {
                             Ok(()) => {}
-                            Err(e) if e.isinstance(&vm.ctx.exceptions.key_error) => {}
+                            Err(e) if e.fast_isinstance(vm.ctx.exceptions.key_error) => {}
                             Err(e) => return Err(e),
                         }
                     }
@@ -281,6 +264,27 @@ impl FrameRef {
             self.lasti.get()
         }
     }
+
+    pub fn is_internal_frame(&self) -> bool {
+        let code = self.clone().f_code();
+        let filename = code.co_filename();
+
+        filename.as_str().contains("importlib") && filename.as_str().contains("_bootstrap")
+    }
+
+    pub fn next_external_frame(&self, vm: &VirtualMachine) -> Option<FrameRef> {
+        self.clone().f_back(vm).map(|mut back| loop {
+            back = if let Some(back) = back.to_owned().f_back(vm) {
+                back
+            } else {
+                break back;
+            };
+
+            if !back.is_internal_frame() {
+                break back;
+            }
+        })
+    }
 }
 
 /// An executing frame; essentially just a struct to combine the immutable data outside the mutex
@@ -289,7 +293,7 @@ struct ExecutingFrame<'a> {
     code: &'a PyRef<PyCode>,
     fastlocals: &'a PyMutex<Box<[Option<PyObjectRef>]>>,
     cells_frees: &'a [PyCellRef],
-    locals: &'a PyMapping,
+    locals: &'a ArgMapping,
     globals: &'a PyDictRef,
     builtins: &'a PyDictRef,
     object: &'a FrameRef,
@@ -352,22 +356,30 @@ impl ExecutingFrame<'_> {
                 }
                 // Instruction raised an exception
                 Err(exception) => {
-                    // 1. Extract traceback from exception's '__traceback__' attr.
-                    // 2. Add new entry with current execution position (filename, lineno, code_object) to traceback.
-                    // 3. Unwind block stack till appropriate handler is found.
+                    #[cold]
+                    fn handle_exception(
+                        frame: &mut ExecutingFrame,
+                        exception: PyBaseExceptionRef,
+                        idx: usize,
+                        vm: &VirtualMachine,
+                    ) -> FrameResult {
+                        // 1. Extract traceback from exception's '__traceback__' attr.
+                        // 2. Add new entry with current execution position (filename, lineno, code_object) to traceback.
+                        // 3. Unwind block stack till appropriate handler is found.
 
-                    let loc = self.code.locations[idx];
+                        let loc = frame.code.locations[idx];
+                        let next = exception.traceback();
+                        let new_traceback =
+                            PyTraceback::new(next, frame.object.clone(), frame.lasti(), loc.row());
+                        vm_trace!("Adding to traceback: {:?} {:?}", new_traceback, loc.row());
+                        exception.set_traceback(Some(new_traceback.into_ref(vm)));
 
-                    let next = exception.traceback();
+                        vm.contextualize_exception(&exception);
 
-                    let new_traceback =
-                        PyTraceback::new(next, self.object.clone(), self.lasti(), loc.row());
-                    vm_trace!("Adding to traceback: {:?} {:?}", new_traceback, loc.row());
-                    exception.set_traceback(Some(new_traceback.into_ref(vm)));
+                        frame.unwind_blocks(vm, UnwindReason::Raising { exception })
+                    }
 
-                    vm.contextualize_exception(&exception);
-
-                    match self.unwind_blocks(vm, UnwindReason::Raising { exception }) {
+                    match handle_exception(self, exception, idx, vm) {
                         Ok(None) => continue,
                         Ok(Some(result)) => {
                             break Ok(result);
@@ -403,7 +415,6 @@ impl ExecutingFrame<'_> {
         exc_tb: PyObjectRef,
     ) -> PyResult<ExecutionResult> {
         if let Some(gen) = self.yield_from_target() {
-            use crate::utils::Either;
             // borrow checker shenanigans - we only need to use exc_type/val/tb if the following
             // variable is Some
             let thrower = if let Some(coro) = self.builtin_coro(gen) {
@@ -416,13 +427,13 @@ impl ExecutingFrame<'_> {
                 let ret = match thrower {
                     Either::A(coro) => coro
                         .throw(gen, exc_type, exc_val, exc_tb, vm)
-                        .into_pyresult(vm), // FIXME:
+                        .to_pyresult(vm), // FIXME:
                     Either::B(meth) => vm.invoke(&meth, (exc_type, exc_val, exc_tb)),
                 };
                 return ret.map(ExecutionResult::Yield).or_else(|err| {
                     self.pop_value();
                     self.update_lasti(|i| *i += 1);
-                    if err.isinstance(&vm.ctx.exceptions.stop_iteration) {
+                    if err.fast_isinstance(vm.ctx.exceptions.stop_iteration) {
                         let val = vm.unwrap_or_none(err.get_arg(0));
                         self.push_value(val);
                         self.run(vm)
@@ -442,19 +453,19 @@ impl ExecutingFrame<'_> {
     }
 
     fn unbound_cell_exception(&self, i: usize, vm: &VirtualMachine) -> PyBaseExceptionRef {
-        if let Some(name) = self.code.cellvars.get(i) {
+        if let Some(&name) = self.code.cellvars.get(i) {
             vm.new_exception_msg(
-                vm.ctx.exceptions.unbound_local_error.clone(),
+                vm.ctx.exceptions.unbound_local_error.to_owned(),
                 format!("local variable '{}' referenced before assignment", name),
             )
         } else {
-            let name = &self.code.freevars[i - self.code.cellvars.len()];
+            let name = self.code.freevars[i - self.code.cellvars.len()];
             vm.new_name_error(
                 format!(
                     "free variable '{}' referenced before assignment in enclosing scope",
                     name
                 ),
-                name,
+                name.to_owned(),
             )
         }
     }
@@ -483,13 +494,18 @@ impl ExecutingFrame<'_> {
             trace!("=======");
         }
 
+        #[cold]
+        fn name_error(name: &'static PyStrInterned, vm: &VirtualMachine) -> PyBaseExceptionRef {
+            vm.new_name_error(format!("name '{name}' is not defined"), name.to_owned())
+        }
+
         match instruction {
             bytecode::Instruction::LoadConst { idx } => {
-                self.push_value(self.code.constants[*idx as usize].0.clone());
+                self.push_value(self.code.constants[*idx as usize].clone().into());
                 Ok(None)
             }
             bytecode::Instruction::ImportName { idx } => {
-                self.import(vm, Some(self.code.names[*idx as usize].clone()))
+                self.import(vm, Some(self.code.names[*idx as usize].to_owned()))
             }
             bytecode::Instruction::ImportNameless => self.import(vm, None),
             bytecode::Instruction::ImportStar => self.import_star(vm),
@@ -499,32 +515,27 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             bytecode::Instruction::LoadFast(idx) => {
-                let idx = *idx as usize;
-                let x = self.fastlocals.lock()[idx].clone().ok_or_else(|| {
+                #[cold]
+                fn reference_error(
+                    varname: &'static PyStrInterned,
+                    vm: &VirtualMachine,
+                ) -> PyBaseExceptionRef {
                     vm.new_exception_msg(
-                        vm.ctx.exceptions.unbound_local_error.clone(),
-                        format!(
-                            "local variable '{}' referenced before assignment",
-                            self.code.varnames[idx]
-                        ),
+                        vm.ctx.exceptions.unbound_local_error.to_owned(),
+                        format!("local variable '{varname}' referenced before assignment",),
                     )
-                })?;
+                }
+                let idx = *idx as usize;
+                let x = self.fastlocals.lock()[idx]
+                    .clone()
+                    .ok_or_else(|| reference_error(self.code.varnames[idx], vm))?;
                 self.push_value(x);
                 Ok(None)
             }
             bytecode::Instruction::LoadNameAny(idx) => {
-                let name = &self.code.names[*idx as usize];
-                // Try using locals as dict first, if not, fallback to generic method.
-                let x = match self
-                    .locals
-                    .clone()
-                    .into_object()
-                    .downcast_exact::<PyDict>(vm)
-                {
-                    Ok(d) => d.get_item_option(name.clone(), vm)?,
-                    Err(o) => o.get_item(name.clone(), vm).ok(),
-                };
-                self.push_value(match x {
+                let name = self.code.names[*idx as usize];
+                let value = self.locals.mapping().subscript(name, vm).ok();
+                self.push_value(match value {
                     Some(x) => x,
                     None => self.load_global_or_builtin(name, vm)?,
                 });
@@ -546,17 +557,8 @@ impl ExecutingFrame<'_> {
             }
             bytecode::Instruction::LoadClassDeref(i) => {
                 let i = *i as usize;
-                let name = self.code.freevars[i - self.code.cellvars.len()].clone();
-                // Try using locals as dict first, if not, fallback to generic method.
-                let value = match self
-                    .locals
-                    .clone()
-                    .into_object()
-                    .downcast_exact::<PyDict>(vm)
-                {
-                    Ok(d) => d.get_item_option(name, vm)?,
-                    Err(o) => o.get_item(name, vm).ok(),
-                };
+                let name = self.code.freevars[i - self.code.cellvars.len()];
+                let value = self.locals.mapping().subscript(name, vm).ok();
                 self.push_value(match value {
                     Some(v) => v,
                     None => self.cells_frees[i]
@@ -571,22 +573,15 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             bytecode::Instruction::StoreLocal(idx) => {
+                let name = self.code.names[*idx as usize];
                 let value = self.pop_value();
-                match self
-                    .locals
-                    .clone()
-                    .into_object()
-                    .downcast_exact::<PyDict>(vm)
-                {
-                    Ok(d) => d.set_item(self.code.names[*idx as usize].clone(), value, vm)?,
-                    Err(o) => o.set_item(self.code.names[*idx as usize].clone(), value, vm)?,
-                };
+                self.locals.mapping().ass_subscript(name, Some(value), vm)?;
                 Ok(None)
             }
             bytecode::Instruction::StoreGlobal(idx) => {
                 let value = self.pop_value();
                 self.globals
-                    .set_item(self.code.names[*idx as usize].clone(), value, vm)?;
+                    .set_item(self.code.names[*idx as usize], value, vm)?;
                 Ok(None)
             }
             bytecode::Instruction::StoreDeref(i) => {
@@ -599,36 +594,24 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             bytecode::Instruction::DeleteLocal(idx) => {
-                let name = &self.code.names[*idx as usize];
-                let res = match self
-                    .locals
-                    .clone()
-                    .into_object()
-                    .downcast_exact::<PyDict>(vm)
-                {
-                    Ok(d) => d.del_item(name.clone(), vm),
-                    Err(o) => o.del_item(name.clone(), vm),
-                };
+                let name = self.code.names[*idx as usize];
+                let res = self.locals.mapping().ass_subscript(name, None, vm);
 
                 match res {
                     Ok(()) => {}
-                    Err(e) if e.isinstance(&vm.ctx.exceptions.key_error) => {
-                        return Err(
-                            vm.new_name_error(format!("name '{}' is not defined", name), name)
-                        )
+                    Err(e) if e.fast_isinstance(vm.ctx.exceptions.key_error) => {
+                        return Err(name_error(name, vm))
                     }
                     Err(e) => return Err(e),
                 }
                 Ok(None)
             }
             bytecode::Instruction::DeleteGlobal(idx) => {
-                let name = &self.code.names[*idx as usize];
-                match self.globals.del_item(name.clone(), vm) {
+                let name = self.code.names[*idx as usize];
+                match self.globals.del_item(name, vm) {
                     Ok(()) => {}
-                    Err(e) if e.isinstance(&vm.ctx.exceptions.key_error) => {
-                        return Err(
-                            vm.new_name_error(format!("name '{}' is not defined", name), name)
-                        )
+                    Err(e) if e.fast_isinstance(vm.ctx.exceptions.key_error) => {
+                        return Err(name_error(name, vm))
                     }
                     Err(e) => return Err(e),
                 }
@@ -653,12 +636,23 @@ impl ExecutingFrame<'_> {
             }
             bytecode::Instruction::Duplicate => {
                 // Duplicate top of stack
-                let value = self.pop_value();
-                self.push_value(value.clone());
+                let value = self.last_value();
                 self.push_value(value);
                 Ok(None)
             }
-            bytecode::Instruction::Rotate { amount } => self.execute_rotate(*amount),
+            bytecode::Instruction::Duplicate2 => {
+                // Duplicate top 2 of stack
+                let top = self.last_value();
+                let second_to_top = self.nth_value(1).to_owned();
+                self.push_value(second_to_top);
+                self.push_value(top);
+                Ok(None)
+            }
+            // splitting the instructions like this offloads the cost of "dynamic" dispatch (on the
+            // amount to rotate) to the opcode dispatcher, and generates optimized code for the
+            // concrete cases we actually have
+            bytecode::Instruction::Rotate2 => self.execute_rotate(2),
+            bytecode::Instruction::Rotate3 => self.execute_rotate(3),
             bytecode::Instruction::BuildString { size } => {
                 let s = self
                     .pop_multiple(*size as usize)
@@ -704,48 +698,45 @@ impl ExecutingFrame<'_> {
                 unpack,
                 for_call,
             } => self.execute_build_map(vm, *size, *unpack, *for_call),
+            bytecode::Instruction::DictUpdate => {
+                let other = self.pop_value();
+                let dict = self
+                    .last_value_ref()
+                    .downcast_ref::<PyDict>()
+                    .expect("exact dict expected");
+                dict.merge_object(other, vm)?;
+                Ok(None)
+            }
             bytecode::Instruction::BuildSlice { step } => self.execute_build_slice(vm, *step),
             bytecode::Instruction::ListAppend { i } => {
-                let obj = self.nth_value(*i);
-                let list: PyListRef = unsafe {
-                    // SAFETY: trust compiler
-                    obj.downcast_unchecked()
-                };
                 let item = self.pop_value();
+                let obj = self.nth_value(*i);
+                let list: &Py<PyList> = unsafe {
+                    // SAFETY: trust compiler
+                    obj.downcast_unchecked_ref()
+                };
                 list.append(item);
                 Ok(None)
             }
             bytecode::Instruction::SetAdd { i } => {
-                let obj = self.nth_value(*i);
-                let set: PyRef<PySet> = unsafe {
-                    // SAFETY: trust compiler
-                    obj.downcast_unchecked()
-                };
                 let item = self.pop_value();
+                let obj = self.nth_value(*i);
+                let set: &Py<PySet> = unsafe {
+                    // SAFETY: trust compiler
+                    obj.downcast_unchecked_ref()
+                };
                 set.add(item, vm)?;
                 Ok(None)
             }
             bytecode::Instruction::MapAdd { i } => {
-                let obj = self.nth_value(*i + 1);
-                let dict: PyDictRef = unsafe {
-                    // SAFETY: trust compiler
-                    obj.downcast_unchecked()
-                };
-                let key = self.pop_value();
-                let value = self.pop_value();
-                dict.set_item(key, value, vm)?;
-                Ok(None)
-            }
-            bytecode::Instruction::MapAddRev { i } => {
-                // change order of evalutio of key and value to support Py3.8 Named expressions in dict comprehension
-                let obj = self.nth_value(*i + 1);
-                let dict: PyDictRef = unsafe {
-                    // SAFETY: trust compiler
-                    obj.downcast_unchecked()
-                };
                 let value = self.pop_value();
                 let key = self.pop_value();
-                dict.set_item(key, value, vm)?;
+                let obj = self.nth_value(*i);
+                let dict: &Py<PyDict> = unsafe {
+                    // SAFETY: trust compiler
+                    obj.downcast_unchecked_ref()
+                };
+                dict.set_item(&*key, value, vm)?;
                 Ok(None)
             }
             bytecode::Instruction::BinaryOperation { op } => self.execute_binop(vm, *op),
@@ -756,7 +747,8 @@ impl ExecutingFrame<'_> {
             bytecode::Instruction::StoreAttr { idx } => self.store_attr(vm, *idx),
             bytecode::Instruction::DeleteAttr { idx } => self.delete_attr(vm, *idx),
             bytecode::Instruction::UnaryOperation { ref op } => self.execute_unop(vm, op),
-            bytecode::Instruction::CompareOperation { ref op } => self.execute_compare(vm, op),
+            bytecode::Instruction::TestOperation { ref op } => self.execute_test(vm, op),
+            bytecode::Instruction::CompareOperation { op } => self.execute_compare(vm, *op),
             bytecode::Instruction::ReturnValue => {
                 let value = self.pop_value();
                 self.unwind_blocks(vm, UnwindReason::Returning { value })
@@ -764,36 +756,14 @@ impl ExecutingFrame<'_> {
             bytecode::Instruction::YieldValue => {
                 let value = self.pop_value();
                 let value = if self.code.flags.contains(bytecode::CodeFlags::IS_COROUTINE) {
-                    PyAsyncGenWrappedValue(value).into_object(vm)
+                    PyAsyncGenWrappedValue(value).into_pyobject(vm)
                 } else {
                     value
                 };
                 Ok(Some(ExecutionResult::Yield(value)))
             }
             bytecode::Instruction::YieldFrom => self.execute_yield_from(vm),
-            bytecode::Instruction::SetupAnnotation => {
-                // Try using locals as dict first, if not, fallback to generic method.
-                let has_annotations = match self
-                    .locals
-                    .clone()
-                    .into_object()
-                    .downcast_exact::<PyDict>(vm)
-                {
-                    Ok(d) => d.contains_key("__annotations__", vm),
-                    Err(o) => {
-                        let needle = vm.new_pyobj("__annotations__");
-                        self._in(vm, needle, o)?
-                    }
-                };
-                if !has_annotations {
-                    self.locals.as_object().set_item(
-                        "__annotations__",
-                        vm.ctx.new_dict().into(),
-                        vm,
-                    )?;
-                }
-                Ok(None)
-            }
+            bytecode::Instruction::SetupAnnotation => self.setup_annotations(vm),
             bytecode::Instruction::SetupLoop { break_target } => {
                 self.push_block(BlockType::Loop {
                     break_target: *break_target,
@@ -835,19 +805,23 @@ impl ExecutingFrame<'_> {
             }
             bytecode::Instruction::SetupWith { end } => {
                 let context_manager = self.pop_value();
-                let exit = context_manager.clone().get_attr("__exit__", vm)?;
+                let enter_res = vm.call_special_method(
+                    context_manager.clone(),
+                    identifier!(vm, __enter__),
+                    (),
+                )?;
+                let exit = context_manager.get_attr(identifier!(vm, __exit__), vm)?;
                 self.push_value(exit);
-                // Call enter:
-                let enter_res = vm.call_special_method(context_manager, "__enter__", ())?;
                 self.push_block(BlockType::Finally { handler: *end });
                 self.push_value(enter_res);
                 Ok(None)
             }
             bytecode::Instruction::BeforeAsyncWith => {
                 let mgr = self.pop_value();
-                let aexit = mgr.clone().get_attr("__aexit__", vm)?;
+                let aenter_res =
+                    vm.call_special_method(mgr.clone(), identifier!(vm, __aenter__), ())?;
+                let aexit = mgr.get_attr(identifier!(vm, __aexit__), vm)?;
                 self.push_value(aexit);
-                let aenter_res = vm.call_special_method(mgr, "__aenter__", ())?;
                 self.push_value(aenter_res);
 
                 Ok(None)
@@ -915,13 +889,16 @@ impl ExecutingFrame<'_> {
                 let awaitable = if awaited_obj.payload_is::<PyCoroutine>() {
                     awaited_obj
                 } else {
-                    let await_method =
-                        vm.get_method_or_type_error(awaited_obj.clone(), "__await__", || {
+                    let await_method = vm.get_method_or_type_error(
+                        awaited_obj.clone(),
+                        identifier!(vm, __await__),
+                        || {
                             format!(
                                 "object {} can't be used in 'await' expression",
                                 awaited_obj.class().name(),
                             )
-                        })?;
+                        },
+                    )?;
                     vm.invoke(&await_method, ())?
                 };
                 self.push_value(awaitable);
@@ -929,17 +906,17 @@ impl ExecutingFrame<'_> {
             }
             bytecode::Instruction::GetAIter => {
                 let aiterable = self.pop_value();
-                let aiter = vm.call_special_method(aiterable, "__aiter__", ())?;
+                let aiter = vm.call_special_method(aiterable, identifier!(vm, __aiter__), ())?;
                 self.push_value(aiter);
                 Ok(None)
             }
             bytecode::Instruction::GetANext => {
                 let aiter = self.last_value();
-                let awaitable = vm.call_special_method(aiter, "__anext__", ())?;
+                let awaitable = vm.call_special_method(aiter, identifier!(vm, __anext__), ())?;
                 let awaitable = if awaitable.payload_is::<PyCoroutine>() {
                     awaitable
                 } else {
-                    vm.call_special_method(awaitable, "__await__", ())?
+                    vm.call_special_method(awaitable, identifier!(vm, __await__), ())?
                 };
                 self.push_value(awaitable);
                 Ok(None)
@@ -947,7 +924,7 @@ impl ExecutingFrame<'_> {
             bytecode::Instruction::EndAsyncFor => {
                 let exc = self.pop_value();
                 self.pop_value(); // async iterator we were calling __anext__ on
-                if exc.isinstance(&vm.ctx.exceptions.stop_async_iteration) {
+                if exc.fast_isinstance(vm.ctx.exceptions.stop_async_iteration) {
                     vm.take_exception().expect("Should have exception in stack");
                     Ok(None)
                 } else {
@@ -970,8 +947,8 @@ impl ExecutingFrame<'_> {
             }
             bytecode::Instruction::LoadMethod { idx } => {
                 let obj = self.pop_value();
-                let method_name = self.code.names[*idx as usize].clone();
-                let method = PyMethod::get(obj, method_name, vm)?;
+                let method_name = self.code.names[*idx as usize];
+                let method = PyMethod::get(obj, method_name.to_owned(), vm)?;
                 let (target, is_method, func) = match method {
                     PyMethod::Function { target, func } => (target, true, func),
                     PyMethod::Attribute(val) => (vm.ctx.none(), false, val),
@@ -1041,76 +1018,22 @@ impl ExecutingFrame<'_> {
 
             bytecode::Instruction::Raise { kind } => self.execute_raise(vm, *kind),
 
-            bytecode::Instruction::Break => self.unwind_blocks(vm, UnwindReason::Break),
+            bytecode::Instruction::Break { target: _ } => {
+                self.unwind_blocks(vm, UnwindReason::Break)
+            }
             bytecode::Instruction::Continue { target } => {
                 self.unwind_blocks(vm, UnwindReason::Continue { target: *target })
             }
-            bytecode::Instruction::PrintExpr => {
-                let expr = self.pop_value();
-
-                let displayhook = vm
-                    .sys_module
-                    .clone()
-                    .get_attr("displayhook", vm)
-                    .map_err(|_| vm.new_runtime_error("lost sys.displayhook".to_owned()))?;
-                vm.invoke(&displayhook, (expr,))?;
-
-                Ok(None)
-            }
+            bytecode::Instruction::PrintExpr => self.print_expr(vm),
             bytecode::Instruction::LoadBuildClass => {
-                self.push_value(vm.builtins.clone().get_attr("__build_class__", vm)?);
+                self.push_value(vm.builtins.get_attr(identifier!(vm, __build_class__), vm)?);
                 Ok(None)
             }
-            bytecode::Instruction::UnpackSequence { size } => {
-                let value = self.pop_value();
-                let elements = vm.extract_elements(&value).map_err(|e| {
-                    if e.class().is(&vm.ctx.exceptions.type_error) {
-                        vm.new_type_error(format!(
-                            "cannot unpack non-iterable {} object",
-                            value.class().name()
-                        ))
-                    } else {
-                        e
-                    }
-                })?;
-                let msg = match elements.len().cmp(&(*size as usize)) {
-                    std::cmp::Ordering::Equal => {
-                        self.state.stack.extend(elements.into_iter().rev());
-                        None
-                    }
-                    std::cmp::Ordering::Greater => {
-                        Some(format!("too many values to unpack (expected {})", size))
-                    }
-                    std::cmp::Ordering::Less => Some(format!(
-                        "not enough values to unpack (expected {}, got {})",
-                        size,
-                        elements.len()
-                    )),
-                };
-                if let Some(msg) = msg {
-                    Err(vm.new_value_error(msg))
-                } else {
-                    Ok(None)
-                }
-            }
+            bytecode::Instruction::UnpackSequence { size } => self.unpack_sequence(*size, vm),
             bytecode::Instruction::UnpackEx { before, after } => {
                 self.execute_unpack_ex(vm, *before, *after)
             }
-            bytecode::Instruction::FormatValue { conversion } => {
-                use bytecode::ConversionFlag;
-                let value = self.pop_value();
-                let value = match conversion {
-                    ConversionFlag::Str => value.str(vm)?.into(),
-                    ConversionFlag::Repr => value.repr(vm)?.into(),
-                    ConversionFlag::Ascii => vm.ctx.new_str(builtins::ascii(value, vm)?).into(),
-                    ConversionFlag::None => value,
-                };
-
-                let spec = self.pop_value();
-                let formatted = vm.call_special_method(value, "__format__", (spec,))?;
-                self.push_value(formatted);
-                Ok(None)
-            }
+            bytecode::Instruction::FormatValue { conversion } => self.format_value(*conversion, vm),
             bytecode::Instruction::PopException {} => {
                 let block = self.pop_block();
                 if let BlockType::ExceptHandler { prev_exc } = block.typ {
@@ -1129,10 +1052,12 @@ impl ExecutingFrame<'_> {
     }
 
     #[inline]
-    fn load_global_or_builtin(&self, name: &PyStrRef, vm: &VirtualMachine) -> PyResult {
+    fn load_global_or_builtin(&self, name: &Py<PyStr>, vm: &VirtualMachine) -> PyResult {
         self.globals
-            .get_chain(self.builtins, name.clone(), vm)?
-            .ok_or_else(|| vm.new_name_error(format!("name '{}' is not defined", name), name))
+            .get_chain(self.builtins, name, vm)?
+            .ok_or_else(|| {
+                vm.new_name_error(format!("name '{}' is not defined", name), name.to_owned())
+            })
     }
 
     #[cfg_attr(feature = "flame-it", flame("Frame"))]
@@ -1144,9 +1069,10 @@ impl ExecutingFrame<'_> {
     ) -> PyResult<Vec<PyObjectRef>> {
         let elements = self.pop_multiple(size);
         if unpack {
-            let mut result: Vec<PyObjectRef> = vec![];
+            let mut result = Vec::<PyObjectRef>::new();
             for element in elements {
-                result.extend(vm.extract_elements(&element)?);
+                let items: Vec<_> = element.try_to_value(vm)?;
+                result.extend(items);
             }
             Ok(result)
         } else {
@@ -1156,7 +1082,7 @@ impl ExecutingFrame<'_> {
 
     #[cfg_attr(feature = "flame-it", flame("Frame"))]
     fn import(&mut self, vm: &VirtualMachine, module: Option<PyStrRef>) -> FrameResult {
-        let module = module.unwrap_or_else(|| PyStr::from("").into_ref(vm));
+        let module = module.unwrap_or_else(|| vm.ctx.empty_str.clone());
         let from_list = <Option<PyTupleTyped<PyStrRef>>>::try_from_object(vm, self.pop_value())?;
         let level = usize::try_from_object(vm, self.pop_value())?;
 
@@ -1169,14 +1095,16 @@ impl ExecutingFrame<'_> {
     #[cfg_attr(feature = "flame-it", flame("Frame"))]
     fn import_from(&mut self, vm: &VirtualMachine, idx: bytecode::NameIdx) -> PyResult {
         let module = self.last_value();
-        let name = &self.code.names[idx as usize];
-        let err = || vm.new_import_error(format!("cannot import name '{}'", name), name.clone());
+        let name = self.code.names[idx as usize];
+        let err = || vm.new_import_error(format!("cannot import name '{}'", name), name);
         // Load attribute, and transform any error into import error.
-        if let Some(obj) = vm.get_attribute_opt(module.clone(), name.clone())? {
+        if let Some(obj) = vm.get_attribute_opt(module.clone(), name)? {
             return Ok(obj);
         }
         // fallback to importing '{module.__name__}.{name}' from sys.modules
-        let mod_name = module.get_attr("__name__", vm).map_err(|_| err())?;
+        let mod_name = module
+            .get_attr(identifier!(vm, __name__), vm)
+            .map_err(|_| err())?;
         let mod_name = mod_name.downcast::<PyStr>().map_err(|_| err())?;
         let full_mod_name = format!("{}.{}", mod_name, name);
         let sys_modules = vm
@@ -1184,7 +1112,7 @@ impl ExecutingFrame<'_> {
             .clone()
             .get_attr("modules", vm)
             .map_err(|_| err())?;
-        sys_modules.get_item(full_mod_name, vm).map_err(|_| err())
+        sys_modules.get_item(&full_mod_name, vm).map_err(|_| err())
     }
 
     #[cfg_attr(feature = "flame-it", flame("Frame"))]
@@ -1194,8 +1122,8 @@ impl ExecutingFrame<'_> {
         // Grab all the names from the module and put them in the context
         if let Some(dict) = module.dict() {
             let filter_pred: Box<dyn Fn(&str) -> bool> =
-                if let Ok(all) = dict.get_item("__all__", vm) {
-                    let all: Vec<PyStrRef> = vm.extract_elements(&all)?;
+                if let Ok(all) = dict.get_item(identifier!(vm, __all__), vm) {
+                    let all: Vec<PyStrRef> = all.try_to_value(vm)?;
                     let all: Vec<String> = all
                         .into_iter()
                         .map(|name| name.as_str().to_owned())
@@ -1204,18 +1132,10 @@ impl ExecutingFrame<'_> {
                 } else {
                     Box::new(|name| !name.starts_with('_'))
                 };
-            for (k, v) in &dict {
+            for (k, v) in dict {
                 let k = PyStrRef::try_from_object(vm, k)?;
                 if filter_pred(k.as_str()) {
-                    match self
-                        .locals
-                        .clone()
-                        .into_object()
-                        .downcast_exact::<PyDict>(vm)
-                    {
-                        Ok(d) => d.set_item(k, v, vm)?,
-                        Err(o) => o.set_item(k, v, vm)?,
-                    };
+                    self.locals.mapping().ass_subscript(&k, Some(v), vm)?;
                 }
             }
         }
@@ -1289,33 +1209,17 @@ impl ExecutingFrame<'_> {
         }
     }
 
-    fn execute_rotate(&mut self, amount: u32) -> FrameResult {
-        // Shuffles top of stack amount down
-        if amount < 2 {
-            self.fatal("Can only rotate two or more values");
-        }
-
-        let mut values = Vec::new();
-
-        // Pop all values from stack:
-        for _ in 0..amount {
-            values.push(self.pop_value());
-        }
-
-        // Push top of stack back first:
-        self.push_value(values.remove(0));
-
-        // Push other value back in order:
-        for value in values.into_iter().rev() {
-            self.push_value(value);
-        }
+    #[inline(always)]
+    fn execute_rotate(&mut self, amount: usize) -> FrameResult {
+        let i = self.state.stack.len() - amount;
+        self.state.stack[i..].rotate_right(1);
         Ok(None)
     }
 
     fn execute_subscript(&mut self, vm: &VirtualMachine) -> FrameResult {
         let b_ref = self.pop_value();
         let a_ref = self.pop_value();
-        let value = a_ref.get_item(b_ref, vm)?;
+        let value = a_ref.get_item(&*b_ref, vm)?;
         self.push_value(value);
         Ok(None)
     }
@@ -1324,14 +1228,14 @@ impl ExecutingFrame<'_> {
         let idx = self.pop_value();
         let obj = self.pop_value();
         let value = self.pop_value();
-        obj.set_item(idx, value, vm)?;
+        obj.set_item(&*idx, value, vm)?;
         Ok(None)
     }
 
     fn execute_delete_subscript(&mut self, vm: &VirtualMachine) -> FrameResult {
         let idx = self.pop_value();
         let obj = self.pop_value();
-        obj.del_item(idx, vm)?;
+        obj.del_item(&*idx, vm)?;
         Ok(None)
     }
 
@@ -1353,7 +1257,7 @@ impl ExecutingFrame<'_> {
                 for (key, value) in dict {
                     #[allow(clippy::collapsible_if)]
                     if for_call {
-                        if map_obj.contains_key(key.clone(), vm) {
+                        if map_obj.contains_key(&*key, vm) {
                             let key_repr = &key.repr(vm)?;
                             let msg = format!(
                                 "got multiple values for keyword argument {}",
@@ -1362,12 +1266,12 @@ impl ExecutingFrame<'_> {
                             return Err(vm.new_type_error(msg));
                         }
                     }
-                    map_obj.set_item(key, value, vm)?;
+                    map_obj.set_item(&*key, value, vm)?;
                 }
             }
         } else {
             for (key, value) in self.pop_multiple(2 * size).tuples() {
-                map_obj.set_item(key, value, vm)?;
+                map_obj.set_item(&*key, value, vm)?;
             }
         }
 
@@ -1429,7 +1333,7 @@ impl ExecutingFrame<'_> {
             IndexMap::new()
         };
         let args = self.pop_value();
-        let args = vm.extract_elements(&args)?;
+        let args = args.try_to_value(vm)?;
         Ok(FuncArgs { args, kwargs })
     }
 
@@ -1542,7 +1446,7 @@ impl ExecutingFrame<'_> {
     fn execute_unpack_ex(&mut self, vm: &VirtualMachine, before: u8, after: u8) -> FrameResult {
         let (before, after) = (before as usize, after as usize);
         let value = self.pop_value();
-        let mut elements = vm.extract_elements::<PyObjectRef>(&value)?;
+        let elements: Vec<_> = value.try_to_value(vm)?;
         let min_expected = before + after;
 
         let middle = elements.len().checked_sub(min_expected).ok_or_else(|| {
@@ -1553,6 +1457,7 @@ impl ExecutingFrame<'_> {
             ))
         })?;
 
+        let mut elements = elements;
         // Elements on stack from right-to-left:
         self.state
             .stack
@@ -1656,17 +1561,18 @@ impl ExecutingFrame<'_> {
             closure,
             defaults,
             kw_only_defaults,
+            PyMutex::new(qualified_name.clone()),
         )
-        .into_object(vm);
+        .into_pyobject(vm);
 
-        func_obj.set_attr("__doc__", vm.ctx.none(), vm)?;
+        func_obj.set_attr(identifier!(vm, __doc__), vm.ctx.none(), vm)?;
 
         let name = qualified_name.as_str().split('.').next_back().unwrap();
-        func_obj.set_attr("__name__", vm.new_pyobj(name), vm)?;
-        func_obj.set_attr("__qualname__", qualified_name, vm)?;
-        let module = vm.unwrap_or_none(self.globals.get_item_option("__name__", vm)?);
-        func_obj.set_attr("__module__", module, vm)?;
-        func_obj.set_attr("__annotations__", annotations, vm)?;
+        func_obj.set_attr(identifier!(vm, __name__), vm.new_pyobj(name), vm)?;
+        func_obj.set_attr(identifier!(vm, __qualname__), qualified_name, vm)?;
+        let module = vm.unwrap_or_none(self.globals.get_item_opt(identifier!(vm, __name__), vm)?);
+        func_obj.set_attr(identifier!(vm, __module__), module, vm)?;
+        func_obj.set_attr(identifier!(vm, __annotations__), annotations, vm)?;
 
         self.push_value(func_obj);
         Ok(None)
@@ -1738,8 +1644,95 @@ impl ExecutingFrame<'_> {
         Ok(None)
     }
 
-    fn _id(&self, a: PyObjectRef) -> usize {
-        a.get_id()
+    #[cold]
+    fn setup_annotations(&mut self, vm: &VirtualMachine) -> FrameResult {
+        let __annotations__ = identifier!(vm, __annotations__);
+        // Try using locals as dict first, if not, fallback to generic method.
+        let has_annotations = match self
+            .locals
+            .clone()
+            .into_object()
+            .downcast_exact::<PyDict>(vm)
+        {
+            Ok(d) => d.contains_key(__annotations__, vm),
+            Err(o) => {
+                let needle = __annotations__.to_object();
+                self._in(vm, needle, o)?
+            }
+        };
+        if !has_annotations {
+            self.locals
+                .as_object()
+                .set_item(__annotations__, vm.ctx.new_dict().into(), vm)?;
+        }
+        Ok(None)
+    }
+
+    fn print_expr(&mut self, vm: &VirtualMachine) -> FrameResult {
+        let expr = self.pop_value();
+
+        let displayhook = vm
+            .sys_module
+            .clone()
+            .get_attr("displayhook", vm)
+            .map_err(|_| vm.new_runtime_error("lost sys.displayhook".to_owned()))?;
+        vm.invoke(&displayhook, (expr,))?;
+
+        Ok(None)
+    }
+
+    fn unpack_sequence(&mut self, size: u32, vm: &VirtualMachine) -> FrameResult {
+        let value = self.pop_value();
+        let elements: Vec<_> = value.try_to_value(vm).map_err(|e| {
+            if e.class().is(vm.ctx.exceptions.type_error) {
+                vm.new_type_error(format!(
+                    "cannot unpack non-iterable {} object",
+                    value.class().name()
+                ))
+            } else {
+                e
+            }
+        })?;
+        let msg = match elements.len().cmp(&(size as usize)) {
+            std::cmp::Ordering::Equal => {
+                self.state.stack.extend(elements.into_iter().rev());
+                return Ok(None);
+            }
+            std::cmp::Ordering::Greater => {
+                format!("too many values to unpack (expected {})", size)
+            }
+            std::cmp::Ordering::Less => format!(
+                "not enough values to unpack (expected {}, got {})",
+                size,
+                elements.len()
+            ),
+        };
+        Err(vm.new_value_error(msg))
+    }
+
+    fn format_value(
+        &mut self,
+        conversion: bytecode::ConversionFlag,
+        vm: &VirtualMachine,
+    ) -> FrameResult {
+        use bytecode::ConversionFlag;
+        let value = self.pop_value();
+        let value = match conversion {
+            ConversionFlag::Str => value.str(vm)?.into(),
+            ConversionFlag::Repr => value.repr(vm)?.into(),
+            ConversionFlag::Ascii => vm.ctx.new_str(builtins::ascii(value, vm)?).into(),
+            ConversionFlag::None => value,
+        };
+
+        let spec = self.pop_value();
+        let formatted = call_object_format(
+            vm,
+            value,
+            None,
+            spec.downcast_ref::<PyStr>().unwrap().as_str(),
+        )?;
+        self.push_value(formatted.into());
+        Ok(None)
     }
 
     fn _in(
@@ -1748,63 +1741,51 @@ impl ExecutingFrame<'_> {
         needle: PyObjectRef,
         haystack: PyObjectRef,
     ) -> PyResult<bool> {
-        let found = vm._membership(haystack, needle)?;
+        let found = vm._contains(haystack, needle)?;
         found.try_to_bool(vm)
     }
 
+    #[inline(always)]
     fn _not_in(
         &self,
         vm: &VirtualMachine,
         needle: PyObjectRef,
         haystack: PyObjectRef,
     ) -> PyResult<bool> {
-        let found = vm._membership(haystack, needle)?;
-        Ok(!found.try_to_bool(vm)?)
+        Ok(!self._in(vm, needle, haystack)?)
     }
 
-    fn _is(&self, a: PyObjectRef, b: PyObjectRef) -> bool {
-        // Pointer equal:
-        a.is(&b)
-    }
+    #[cfg_attr(feature = "flame-it", flame("Frame"))]
+    fn execute_test(&mut self, vm: &VirtualMachine, op: &bytecode::TestOperator) -> FrameResult {
+        let b = self.pop_value();
+        let a = self.pop_value();
+        let value = match *op {
+            bytecode::TestOperator::Is => a.is(&b),
+            bytecode::TestOperator::IsNot => !a.is(&b),
+            bytecode::TestOperator::In => self._in(vm, a, b)?,
+            bytecode::TestOperator::NotIn => self._not_in(vm, a, b)?,
+            bytecode::TestOperator::ExceptionMatch => a.is_instance(&b, vm)?,
+        };
 
-    fn _is_not(&self, a: PyObjectRef, b: PyObjectRef) -> bool {
-        !a.is(&b)
+        self.push_value(vm.ctx.new_bool(value).into());
+        Ok(None)
     }
 
     #[cfg_attr(feature = "flame-it", flame("Frame"))]
     fn execute_compare(
         &mut self,
         vm: &VirtualMachine,
-        op: &bytecode::ComparisonOperator,
+        op: bytecode::ComparisonOperator,
     ) -> FrameResult {
         let b = self.pop_value();
         let a = self.pop_value();
-        let value = match *op {
-            bytecode::ComparisonOperator::Equal => a.rich_compare(b, PyComparisonOp::Eq, vm)?,
-            bytecode::ComparisonOperator::NotEqual => a.rich_compare(b, PyComparisonOp::Ne, vm)?,
-            bytecode::ComparisonOperator::Less => a.rich_compare(b, PyComparisonOp::Lt, vm)?,
-            bytecode::ComparisonOperator::LessOrEqual => {
-                a.rich_compare(b, PyComparisonOp::Le, vm)?
-            }
-            bytecode::ComparisonOperator::Greater => a.rich_compare(b, PyComparisonOp::Gt, vm)?,
-            bytecode::ComparisonOperator::GreaterOrEqual => {
-                a.rich_compare(b, PyComparisonOp::Ge, vm)?
-            }
-            bytecode::ComparisonOperator::Is => vm.ctx.new_bool(self._is(a, b)).into(),
-            bytecode::ComparisonOperator::IsNot => vm.ctx.new_bool(self._is_not(a, b)).into(),
-            bytecode::ComparisonOperator::In => vm.ctx.new_bool(self._in(vm, a, b)?).into(),
-            bytecode::ComparisonOperator::NotIn => vm.ctx.new_bool(self._not_in(vm, a, b)?).into(),
-            bytecode::ComparisonOperator::ExceptionMatch => {
-                vm.ctx.new_bool(a.is_instance(&b, vm)?).into()
-            }
-        };
-
+        let value = a.rich_compare(b, op.into(), vm)?;
         self.push_value(value);
         Ok(None)
     }
 
     fn load_attr(&mut self, vm: &VirtualMachine, attr: bytecode::NameIdx) -> FrameResult {
-        let attr_name = self.code.names[attr as usize].clone();
+        let attr_name = self.code.names[attr as usize];
         let parent = self.pop_value();
         let obj = parent.get_attr(attr_name, vm)?;
         self.push_value(obj);
@@ -1812,7 +1793,7 @@ impl ExecutingFrame<'_> {
     }
 
     fn store_attr(&mut self, vm: &VirtualMachine, attr: bytecode::NameIdx) -> FrameResult {
-        let attr_name = self.code.names[attr as usize].clone();
+        let attr_name = self.code.names[attr as usize];
         let parent = self.pop_value();
         let value = self.pop_value();
         parent.set_attr(attr_name, value, vm)?;
@@ -1820,7 +1801,7 @@ impl ExecutingFrame<'_> {
     }
 
     fn delete_attr(&mut self, vm: &VirtualMachine, attr: bytecode::NameIdx) -> FrameResult {
-        let attr_name = self.code.names[attr as usize].clone();
+        let attr_name = self.code.names[attr as usize];
         let parent = self.pop_value();
         parent.del_attr(attr_name, vm)?;
         Ok(None)
@@ -1839,17 +1820,20 @@ impl ExecutingFrame<'_> {
         block
     }
 
+    #[inline]
     fn current_block(&self) -> Option<Block> {
         self.state.blocks.last().cloned()
     }
 
+    #[inline]
     fn push_value(&mut self, obj: PyObjectRef) {
         match self.state.stack.try_push(obj) {
             Ok(()) => {}
-            Err(_e) => self.fatal("tried to push value onto stack but overflowed max_stacksize"),
+            Err(_e) => self.fatal("tried to push value onto stack but overflowed max_stackdepth"),
         }
     }
 
+    #[inline]
     fn pop_value(&mut self) -> PyObjectRef {
         match self.state.stack.pop() {
             Some(x) => x,
@@ -1859,9 +1843,10 @@ impl ExecutingFrame<'_> {
 
     fn pop_multiple(&mut self, count: usize) -> crate::common::boxvec::Drain<PyObjectRef> {
         let stack_len = self.state.stack.len();
-        self.state.stack.drain(stack_len - count..stack_len)
+        self.state.stack.drain(stack_len - count..)
     }
 
+    #[inline]
     fn last_value(&self) -> PyObjectRef {
         self.last_value_ref().to_owned()
     }
@@ -1874,8 +1859,10 @@ impl ExecutingFrame<'_> {
         }
     }
 
-    fn nth_value(&self, depth: u32) -> PyObjectRef {
-        self.state.stack[self.state.stack.len() - depth as usize - 1].clone()
+    #[inline]
+    fn nth_value(&self, depth: u32) -> &PyObject {
+        let stack = &self.state.stack;
+        &stack[stack.len() - depth as usize - 1]
     }
 
     #[cold]
@@ -1910,7 +1897,9 @@ impl fmt::Debug for Frame {
         write!(
             f,
             "Frame Object {{ \n Stack:{}\n Blocks:{}\n Locals:{:?}\n}}",
-            stack_str, block_str, locals
+            stack_str,
+            block_str,
+            locals.into_object()
         )
     }
 }

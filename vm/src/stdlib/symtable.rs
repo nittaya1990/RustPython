@@ -3,10 +3,9 @@ pub(crate) use symtable::make_module;
 #[pymodule]
 mod symtable {
     use crate::{
-        builtins::PyStrRef,
-        compile::{self, Symbol, SymbolScope, SymbolTable, SymbolTableType},
-        PyObjectRef, PyRef, PyResult, PyValue, VirtualMachine,
+        builtins::PyStrRef, compiler, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
     };
+    use rustpython_codegen::symboltable::{Symbol, SymbolScope, SymbolTable, SymbolTableType};
     use std::fmt;
 
     /// symtable. Return top level SymbolTable.
@@ -20,10 +19,10 @@ mod symtable {
     ) -> PyResult<PySymbolTableRef> {
         let mode = mode
             .as_str()
-            .parse::<compile::Mode>()
+            .parse::<compiler::Mode>()
             .map_err(|err| vm.new_value_error(err.to_string()))?;
 
-        let symtable = compile::compile_symtable(source.as_str(), mode, filename.as_str())
+        let symtable = compiler::compile_symtable(source.as_str(), mode, filename.as_str())
             .map_err(|err| vm.new_syntax_error(&err))?;
 
         let py_symbol_table = to_py_symbol_table(symtable);
@@ -39,7 +38,7 @@ mod symtable {
 
     #[pyattr]
     #[pyclass(name = "SymbolTable")]
-    #[derive(PyValue)]
+    #[derive(PyPayload)]
     struct PySymbolTable {
         symtable: SymbolTable,
     }
@@ -50,7 +49,7 @@ mod symtable {
         }
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl PySymbolTable {
         #[pymethod]
         fn get_name(&self) -> String {
@@ -143,7 +142,7 @@ mod symtable {
                 .symtable
                 .sub_tables
                 .iter()
-                .map(|t| to_py_symbol_table(t.clone()).into_object(vm))
+                .map(|t| to_py_symbol_table(t.clone()).into_pyobject(vm))
                 .collect();
             Ok(children)
         }
@@ -151,7 +150,7 @@ mod symtable {
 
     #[pyattr]
     #[pyclass(name = "Symbol")]
-    #[derive(PyValue)]
+    #[derive(PyPayload)]
     struct PySymbol {
         symbol: Symbol,
         namespaces: Vec<SymbolTable>,
@@ -163,7 +162,7 @@ mod symtable {
         }
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl PySymbol {
         #[pymethod]
         fn get_name(&self) -> String {
@@ -231,7 +230,7 @@ mod symtable {
             let namespaces = self
                 .namespaces
                 .iter()
-                .map(|table| to_py_symbol_table(table.clone()).into_object(vm))
+                .map(|table| to_py_symbol_table(table.clone()).into_pyobject(vm))
                 .collect();
             Ok(namespaces)
         }

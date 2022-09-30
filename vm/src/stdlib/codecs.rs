@@ -7,13 +7,18 @@ mod _codecs {
         builtins::{PyBaseExceptionRef, PyBytes, PyBytesRef, PyStr, PyStrRef, PyTuple},
         codecs,
         function::{ArgBytesLike, FuncArgs},
-        IdProtocol, PyObject, PyObjectRef, PyResult, TryFromBorrowedObject, VirtualMachine,
+        AsObject, PyObject, PyObjectRef, PyResult, TryFromBorrowedObject, VirtualMachine,
     };
     use std::ops::Range;
 
     #[pyfunction]
     fn register(search_function: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
         vm.state.codec_registry.register(search_function, vm)
+    }
+
+    #[pyfunction]
+    fn unregister(search_function: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        vm.state.codec_registry.unregister(search_function)
     }
 
     #[pyfunction]
@@ -116,7 +121,7 @@ mod _codecs {
             let vm = self.vm;
             let data_str = vm.ctx.new_str(data).into();
             let encode_exc = vm.new_exception(
-                vm.ctx.exceptions.unicode_encode_error.clone(),
+                vm.ctx.exceptions.unicode_encode_error.to_owned(),
                 vec![
                     vm.ctx.new_str(self.encoding).into(),
                     data_str,
@@ -159,7 +164,7 @@ mod _codecs {
             let vm = self.vm;
             let data_bytes: PyObjectRef = vm.ctx.new_bytes(data.to_vec()).into();
             let decode_exc = vm.new_exception(
-                vm.ctx.exceptions.unicode_decode_error.clone(),
+                vm.ctx.exceptions.unicode_decode_error.to_owned(),
                 vec![
                     vm.ctx.new_str(self.encoding).into(),
                     data_bytes.clone(),
@@ -168,7 +173,8 @@ mod _codecs {
                     vm.ctx.new_str(reason).into(),
                 ],
             );
-            let res = vm.invoke(self.handler_func()?, (decode_exc.clone(),))?;
+            let handler = self.handler_func()?;
+            let res = vm.invoke(handler, (decode_exc.clone(),))?;
             let new_data = decode_exc
                 .get_arg(1)
                 .ok_or_else(|| vm.new_type_error("object attribute not set".to_owned()))?;
@@ -217,7 +223,7 @@ mod _codecs {
         ) -> Self::Error {
             let vm = self.vm;
             vm.new_exception(
-                vm.ctx.exceptions.unicode_encode_error.clone(),
+                vm.ctx.exceptions.unicode_encode_error.to_owned(),
                 vec![
                     vm.ctx.new_str(self.encoding).into(),
                     vm.ctx.new_str(data).into(),

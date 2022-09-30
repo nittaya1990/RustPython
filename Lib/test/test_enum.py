@@ -8,7 +8,7 @@ from collections import OrderedDict
 from enum import Enum, IntEnum, EnumMeta, Flag, IntFlag, unique, auto
 from io import StringIO
 from pickle import dumps, loads, PicklingError, HIGHEST_PROTOCOL
-from test import support
+from test.support import ALWAYS_EQ, check__all__, threading_helper
 from datetime import timedelta
 
 
@@ -429,8 +429,6 @@ class TestEnum(unittest.TestCase):
                 green = 2
                 blue = 3
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_enum_with_value_name(self):
         class Huh(Enum):
             name = 1
@@ -749,16 +747,12 @@ class TestEnum(unittest.TestCase):
         test_pickle_dump_load(self.assertIs, FloatStooges.CURLY)
         test_pickle_dump_load(self.assertIs, FloatStooges)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_pickle_enum_function(self):
         if isinstance(Answer, Exception):
             raise Answer
         test_pickle_dump_load(self.assertIs, Answer.him)
         test_pickle_dump_load(self.assertIs, Answer)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_pickle_enum_function_with_module(self):
         if isinstance(Question, Exception):
             raise Question
@@ -1008,8 +1002,6 @@ class TestEnum(unittest.TestCase):
             self.assertIn(e, SummerMonth)
             self.assertIs(type(e), SummerMonth)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_subclassing(self):
         if isinstance(Name, Exception):
             raise Name
@@ -1541,8 +1533,6 @@ class TestEnum(unittest.TestCase):
         globals()['SomeTuple'] = SomeTuple
         test_pickle_dump_load(self.assertIs, SomeTuple.first)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_duplicate_values_give_unique_enum_items(self):
         class AutoNumber(Enum):
             first = ()
@@ -1563,8 +1553,6 @@ class TestEnum(unittest.TestCase):
         self.assertEqual(AutoNumber.third.value, 3)
         self.assertIs(AutoNumber(1), AutoNumber.first)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_inherited_new_from_enhanced_enum(self):
         class AutoNumber(Enum):
             def __new__(cls):
@@ -1581,8 +1569,6 @@ class TestEnum(unittest.TestCase):
         self.assertEqual(list(Color), [Color.red, Color.green, Color.blue])
         self.assertEqual(list(map(int, Color)), [1, 2, 3])
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_inherited_new_from_mixed_enum(self):
         class AutoNumber(IntEnum):
             def __new__(cls):
@@ -1672,8 +1658,6 @@ class TestEnum(unittest.TestCase):
             test = 1
         self.assertIs(type(Test.test), Test)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_subclass_duplicate_name_dynamic(self):
         from types import DynamicClassAttribute
         class Base(Enum):
@@ -1755,8 +1739,6 @@ class TestEnum(unittest.TestCase):
         self.assertTrue(Period.month_1 is Period.day_30)
         self.assertTrue(Period.week_4 is Period.day_28)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_nonhash_value(self):
         class AutoNumberInAList(Enum):
             def __new__(cls):
@@ -2489,7 +2471,7 @@ class TestFlag(unittest.TestCase):
     # TODO: RUSTPYTHON
     @unittest.expectedFailure
     @unittest.skipIf(sys.platform == "win32", "TODO: RUSTPYTHON, inconsistent test result on Windows due to threading")
-    @support.reap_threads
+    @threading_helper.reap_threads
     def test_unique_composite(self):
         # override __eq__ to be identity only
         class TestFlag(Flag):
@@ -2519,7 +2501,7 @@ class TestFlag(unittest.TestCase):
                 threading.Thread(target=cycle_enum)
                 for _ in range(8)
                 ]
-        with support.start_threads(threads):
+        with threading_helper.start_threads(threads):
             pass
         # check that only 248 members were created
         self.assertFalse(
@@ -2637,8 +2619,6 @@ class TestIntFlag(unittest.TestCase):
         self.assertEqual(format(Perm.R, ''), '4')
         self.assertEqual(format(Perm.R | Perm.X, ''), '5')
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_or(self):
         Perm = self.Perm
         for i in Perm:
@@ -2660,8 +2640,6 @@ class TestIntFlag(unittest.TestCase):
         Open = self.Open
         self.assertIs(Open.RO | Open.CE, Open.CE)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_and(self):
         Perm = self.Perm
         RW = Perm.R | Perm.W
@@ -2688,8 +2666,6 @@ class TestIntFlag(unittest.TestCase):
         Open = self.Open
         self.assertIs(Open.RO & Open.CE, Open.RO)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_xor(self):
         Perm = self.Perm
         for i in Perm:
@@ -2922,7 +2898,7 @@ class TestIntFlag(unittest.TestCase):
     # TODO: RUSTPYTHON
     @unittest.expectedFailure
     @unittest.skipIf(sys.platform == "win32", "TODO: RUSTPYTHON, inconsistent test result on Windows due to threading")
-    @support.reap_threads
+    @threading_helper.reap_threads
     def test_unique_composite(self):
         # override __eq__ to be identity only
         class TestFlag(IntFlag):
@@ -2952,7 +2928,7 @@ class TestIntFlag(unittest.TestCase):
                 threading.Thread(target=cycle_enum)
                 for _ in range(8)
                 ]
-        with support.start_threads(threads):
+        with threading_helper.start_threads(threads):
             pass
         # check that only 248 members were created
         self.assertFalse(
@@ -3183,7 +3159,7 @@ class TestStdLib(unittest.TestCase):
 
 class MiscTestCase(unittest.TestCase):
     def test__all__(self):
-        support.check__all__(self, enum)
+        check__all__(self, enum)
 
 
 # These are unordered here on purpose to ensure that declaration order

@@ -1,11 +1,4 @@
-use crate::vm::{PyClassImpl, PyObjectRef, VirtualMachine};
-
-pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
-    let ctx = &vm.ctx;
-    _csv::Reader::make_class(ctx);
-    _csv::Writer::make_class(ctx);
-    _csv::make_module(vm)
-}
+pub(crate) use _csv::make_module;
 
 #[pymodule]
 mod _csv {
@@ -16,7 +9,7 @@ mod _csv {
         match_class,
         protocol::{PyIter, PyIterReturn},
         types::{IterNext, IterNextIterable},
-        PyObjectRef, PyObjectView, PyResult, PyValue, TryFromObject, TypeProtocol, VirtualMachine,
+        AsObject, Py, PyObjectRef, PyPayload, PyResult, TryFromObject, VirtualMachine,
     };
     use itertools::{self, Itertools};
     use std::fmt;
@@ -35,7 +28,7 @@ mod _csv {
         vm.ctx.new_exception_type(
             "_csv",
             "Error",
-            Some(vec![vm.ctx.exceptions.exception_type.clone()]),
+            Some(vec![vm.ctx.exceptions.exception_type.to_owned()]),
         )
     }
 
@@ -160,7 +153,7 @@ mod _csv {
     }
 
     #[pyclass(noattr, module = "_csv", name = "reader")]
-    #[derive(PyValue)]
+    #[derive(PyPayload)]
     pub(super) struct Reader {
         iter: PyIter,
         state: PyMutex<ReadState>,
@@ -172,11 +165,11 @@ mod _csv {
         }
     }
 
-    #[pyimpl(with(IterNext))]
+    #[pyclass(with(IterNext))]
     impl Reader {}
     impl IterNextIterable for Reader {}
     impl IterNext for Reader {
-        fn next(zelf: &PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+        fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
             let string = match zelf.iter.next(vm)? {
                 PyIterReturn::Return(obj) => obj,
                 PyIterReturn::StopIteration(v) => return Ok(PyIterReturn::StopIteration(v)),
@@ -250,7 +243,7 @@ mod _csv {
     }
 
     #[pyclass(noattr, module = "_csv", name = "writer")]
-    #[derive(PyValue)]
+    #[derive(PyPayload)]
     pub(super) struct Writer {
         write: PyObjectRef,
         state: PyMutex<WriteState>,
@@ -262,7 +255,7 @@ mod _csv {
         }
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl Writer {
         #[pymethod]
         fn writerow(&self, row: PyObjectRef, vm: &VirtualMachine) -> PyResult {

@@ -1,7 +1,9 @@
-#![cfg_attr(target_os = "wasi", allow(dead_code))]
-use rustpython_vm::builtins::{PyDictRef, PyStrRef};
-use rustpython_vm::VirtualMachine;
-use rustpython_vm::{function::ArgIterable, PyResult, TryFromObject};
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+use rustpython_vm::{
+    builtins::{PyDictRef, PyStrRef},
+    function::ArgIterable,
+    identifier, PyResult, TryFromObject, VirtualMachine,
+};
 
 pub struct ShellHelper<'vm> {
     vm: &'vm VirtualMachine,
@@ -55,7 +57,6 @@ impl<'vm> ShellHelper<'vm> {
         ShellHelper { vm, globals }
     }
 
-    #[allow(clippy::type_complexity)]
     fn get_available_completions<'w>(
         &self,
         words: &'w [String],
@@ -74,23 +75,25 @@ impl<'vm> ShellHelper<'vm> {
             // last: the last word, could be empty if it ends with a dot
             // parents: the words before the dot
 
-            let mut current = self
-                .globals
-                .get_item_option(first.as_str(), self.vm)
-                .ok()??;
+            let mut current = self.globals.get_item_opt(first.as_str(), self.vm).ok()??;
 
             for attr in parents {
-                current = current.clone().get_attr(attr.as_str(), self.vm).ok()?;
+                current = current.get_attr(attr.as_str(), self.vm).ok()?;
             }
 
-            let current_iter = str_iter_method(current, "__dir__").ok()?;
+            let current_iter = str_iter_method(current, identifier!(self.vm, __dir__)).ok()?;
 
             (last, current_iter, None)
         } else {
             // we need to get a variable based off of globals/builtins
 
-            let globals = str_iter_method(self.globals.as_object().to_owned(), "keys").ok()?;
-            let builtins = str_iter_method(self.vm.builtins.clone(), "__dir__").ok()?;
+            let globals =
+                str_iter_method(self.globals.clone().into(), identifier!(self.vm, keys)).ok()?;
+            let builtins = str_iter_method(
+                self.vm.builtins.clone().into(),
+                identifier!(self.vm, __dir__),
+            )
+            .ok()?;
             (first, globals, Some(builtins))
         };
         Some((word_start, iter1.chain(iter2.into_iter().flatten())))
@@ -144,7 +147,7 @@ impl<'vm> ShellHelper<'vm> {
 }
 
 cfg_if::cfg_if! {
-    if #[cfg(not(target_os = "wasi"))] {
+    if #[cfg(not(target_arch = "wasm32"))] {
         use rustyline::{
             completion::Completer, highlight::Highlighter, hint::Hinter, validate::Validator, Context,
             Helper,

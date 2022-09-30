@@ -1,31 +1,35 @@
-use super::PyTypeRef;
+use super::{PyType, PyTypeRef};
 use crate::{
-    function::IntoPyObject, types::Constructor, PyClassImpl, PyContext, PyObjectRef, PyResult,
-    PyValue, TypeProtocol, VirtualMachine,
+    atomic_func,
+    class::PyClassImpl,
+    convert::ToPyObject,
+    protocol::PyNumberMethods,
+    types::{AsNumber, Constructor},
+    Context, Py, PyObjectRef, PyPayload, PyResult, VirtualMachine,
 };
 
 #[pyclass(module = false, name = "NoneType")]
 #[derive(Debug)]
 pub struct PyNone;
 
-impl PyValue for PyNone {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.none_type
+impl PyPayload for PyNone {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.none_type
     }
 }
 
 // This allows a built-in function to not return a value, mapping to
 // Python's behavior of returning `None` in this situation.
-impl IntoPyObject for () {
-    fn into_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
+impl ToPyObject for () {
+    fn to_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
         vm.ctx.none()
     }
 }
 
-impl<T: IntoPyObject> IntoPyObject for Option<T> {
-    fn into_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
+impl<T: ToPyObject> ToPyObject for Option<T> {
+    fn to_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
         match self {
-            Some(x) => x.into_pyobject(vm),
+            Some(x) => x.to_pyobject(vm),
             None => vm.ctx.none(),
         }
     }
@@ -39,7 +43,7 @@ impl Constructor for PyNone {
     }
 }
 
-#[pyimpl(with(Constructor))]
+#[pyclass(with(Constructor, AsNumber))]
 impl PyNone {
     #[pymethod(magic)]
     fn repr(&self) -> String {
@@ -52,13 +56,23 @@ impl PyNone {
     }
 }
 
+impl AsNumber for PyNone {
+    fn as_number() -> &'static PyNumberMethods {
+        static AS_NUMBER: PyNumberMethods = PyNumberMethods {
+            boolean: atomic_func!(|_number, _vm| Ok(false)),
+            ..PyNumberMethods::NOT_IMPLEMENTED
+        };
+        &AS_NUMBER
+    }
+}
+
 #[pyclass(module = false, name = "NotImplementedType")]
 #[derive(Debug)]
 pub struct PyNotImplemented;
 
-impl PyValue for PyNotImplemented {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.not_implemented_type
+impl PyPayload for PyNotImplemented {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.not_implemented_type
     }
 }
 
@@ -70,7 +84,7 @@ impl Constructor for PyNotImplemented {
     }
 }
 
-#[pyimpl(with(Constructor))]
+#[pyclass(with(Constructor))]
 impl PyNotImplemented {
     // TODO: As per https://bugs.python.org/issue35712, using NotImplemented
     // in boolean contexts will need to raise a DeprecationWarning in 3.9
@@ -84,9 +98,14 @@ impl PyNotImplemented {
     fn repr(&self) -> String {
         "NotImplemented".to_owned()
     }
+
+    #[pymethod(magic)]
+    fn reduce(&self) -> String {
+        "NotImplemented".to_owned()
+    }
 }
 
-pub fn init(context: &PyContext) {
-    PyNone::extend_class(context, &context.none.clone_class());
-    PyNotImplemented::extend_class(context, &context.not_implemented.clone_class());
+pub fn init(context: &Context) {
+    PyNone::extend_class(context, context.types.none_type);
+    PyNotImplemented::extend_class(context, context.types.not_implemented_type);
 }

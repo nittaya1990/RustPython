@@ -1,107 +1,156 @@
-use crate::types::PyComparisonOp;
-use crate::vm::VirtualMachine;
-use crate::{PyObjectRef, PyResult};
+use crate::{
+    builtins::PyIntRef, function::OptionalArg, sliceable::SequenceIndexOp, types::PyComparisonOp,
+    vm::VirtualMachine, AsObject, PyObject, PyObjectRef, PyResult,
+};
+use optional::Optioned;
+use std::ops::Range;
 
-pub(super) type DynPyIter<'a> = Box<dyn ExactSizeIterator<Item = &'a PyObjectRef> + 'a>;
+pub trait MutObjectSequenceOp<'a> {
+    type Guard;
 
-#[allow(clippy::len_without_is_empty)]
-pub(crate) trait SimpleSeq {
-    fn len(&self) -> usize;
-    fn boxed_iter(&self) -> DynPyIter;
-}
+    fn do_get(index: usize, guard: &Self::Guard) -> Option<&PyObjectRef>;
+    fn do_lock(&'a self) -> Self::Guard;
 
-impl<'a, D> SimpleSeq for D
-where
-    D: 'a + std::ops::Deref<Target = [PyObjectRef]>,
-{
-    fn len(&self) -> usize {
-        self.deref().len()
+    fn mut_count(&'a self, vm: &VirtualMachine, needle: &PyObject) -> PyResult<usize> {
+        let mut count = 0;
+        self._mut_iter_equal_skeleton::<_, false>(vm, needle, 0..isize::MAX as usize, || {
+            count += 1
+        })?;
+        Ok(count)
     }
 
-    fn boxed_iter(&self) -> DynPyIter {
-        Box::new(self.deref().iter())
+    fn mut_index_range(
+        &'a self,
+        vm: &VirtualMachine,
+        needle: &PyObject,
+        range: Range<usize>,
+    ) -> PyResult<Optioned<usize>> {
+        self._mut_iter_equal_skeleton::<_, true>(vm, needle, range, || {})
     }
-}
 
-pub(crate) fn eq(vm: &VirtualMachine, zelf: DynPyIter, other: DynPyIter) -> PyResult<bool> {
-    if zelf.len() == other.len() {
-        for (a, b) in Iterator::zip(zelf, other) {
-            if !vm.identical_or_equal(a, b)? {
-                return Ok(false);
+    fn mut_index(&'a self, vm: &VirtualMachine, needle: &PyObject) -> PyResult<Optioned<usize>> {
+        self.mut_index_range(vm, needle, 0..isize::MAX as usize)
+    }
+
+    fn mut_contains(&'a self, vm: &VirtualMachine, needle: &PyObject) -> PyResult<bool> {
+        self.mut_index(vm, needle).map(|x| x.is_some())
+    }
+
+    fn _mut_iter_equal_skeleton<F, const SHORT: bool>(
+        &'a self,
+        vm: &VirtualMachine,
+        needle: &PyObject,
+        range: Range<usize>,
+        mut f: F,
+    ) -> PyResult<Optioned<usize>>
+    where
+        F: FnMut(),
+    {
+        let mut borrower = None;
+        let mut i = range.start;
+
+        let index = loop {
+            if i >= range.end {
+                break Optioned::<usize>::none();
             }
-        }
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
+            let guard = if let Some(x) = borrower.take() {
+                x
+            } else {
+                self.do_lock()
+            };
 
-pub fn cmp(
-    vm: &VirtualMachine,
-    zelf: DynPyIter,
-    other: DynPyIter,
-    op: PyComparisonOp,
-) -> PyResult<bool> {
-    let less = match op {
-        PyComparisonOp::Eq => return eq(vm, zelf, other),
-        PyComparisonOp::Ne => return eq(vm, zelf, other).map(|eq| !eq),
-        PyComparisonOp::Lt | PyComparisonOp::Le => true,
-        PyComparisonOp::Gt | PyComparisonOp::Ge => false,
-    };
-    let (lhs_len, rhs_len) = (zelf.len(), other.len());
-    for (a, b) in Iterator::zip(zelf, other) {
-        let ret = if less {
-            vm.bool_seq_lt(a, b)?
-        } else {
-            vm.bool_seq_gt(a, b)?
-        };
-        if let Some(v) = ret {
-            return Ok(v);
-        }
-    }
-    Ok(op.eval_ord(lhs_len.cmp(&rhs_len)))
-}
+            let elem = if let Some(x) = Self::do_get(i, &guard) {
+                x
+            } else {
+                break Optioned::<usize>::none();
+            };
 
-pub(crate) struct SeqMul<'a> {
-    seq: &'a dyn SimpleSeq,
-    repetitions: usize,
-    iter: Option<DynPyIter<'a>>,
-}
+            if elem.is(needle) {
+                f();
+                if SHORT {
+                    break Optioned::<usize>::some(i);
+                }
+                borrower = Some(guard);
+            } else {
+                let elem = elem.clone();
+                drop(guard);
 
-impl ExactSizeIterator for SeqMul<'_> {}
-
-impl<'a> Iterator for SeqMul<'a> {
-    type Item = &'a PyObjectRef;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.iter.as_mut().and_then(Iterator::next) {
-            Some(item) => Some(item),
-            None => {
-                if self.repetitions == 0 {
-                    None
-                } else {
-                    self.repetitions -= 1;
-                    self.iter = Some(self.seq.boxed_iter());
-                    self.next()
+                if elem.rich_compare_bool(needle, PyComparisonOp::Eq, vm)? {
+                    f();
+                    if SHORT {
+                        break Optioned::<usize>::some(i);
+                    }
                 }
             }
-        }
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = self.iter.as_ref().map_or(0, ExactSizeIterator::len)
-            + (self.repetitions * self.seq.len());
-        (size, Some(size))
+            i += 1;
+        };
+
+        Ok(index)
     }
 }
 
-pub(crate) fn seq_mul<'a>(
-    vm: &VirtualMachine,
-    seq: &'a impl SimpleSeq,
-    repetitions: isize,
-) -> PyResult<SeqMul<'a>> {
-    vm.check_repeat_or_memory_error(seq.len(), repetitions)
-        .map(|repetitions| SeqMul {
-            seq,
-            repetitions,
-            iter: None,
-        })
+pub trait SequenceExt<T: Clone>
+where
+    Self: AsRef<[T]>,
+{
+    fn mul(&self, vm: &VirtualMachine, n: isize) -> PyResult<Vec<T>> {
+        let n = vm.check_repeat_or_overflow_error(self.as_ref().len(), n)?;
+        let mut v = Vec::with_capacity(n * self.as_ref().len());
+        for _ in 0..n {
+            v.extend_from_slice(self.as_ref());
+        }
+        Ok(v)
+    }
+}
+
+impl<T: Clone> SequenceExt<T> for [T] {}
+
+pub trait SequenceMutExt<T: Clone>
+where
+    Self: AsRef<[T]>,
+{
+    fn as_vec_mut(&mut self) -> &mut Vec<T>;
+
+    fn imul(&mut self, vm: &VirtualMachine, n: isize) -> PyResult<()> {
+        let n = vm.check_repeat_or_overflow_error(self.as_ref().len(), n)?;
+        if n == 0 {
+            self.as_vec_mut().clear();
+        } else if n != 1 {
+            let mut sample = self.as_vec_mut().clone();
+            if n != 2 {
+                self.as_vec_mut().reserve(sample.len() * (n - 1));
+                for _ in 0..n - 2 {
+                    self.as_vec_mut().extend_from_slice(&sample);
+                }
+            }
+            self.as_vec_mut().append(&mut sample);
+        }
+        Ok(())
+    }
+}
+
+impl<T: Clone> SequenceMutExt<T> for Vec<T> {
+    fn as_vec_mut(&mut self) -> &mut Vec<T> {
+        self
+    }
+}
+
+#[derive(FromArgs)]
+pub struct OptionalRangeArgs {
+    #[pyarg(positional, optional)]
+    start: OptionalArg<PyObjectRef>,
+    #[pyarg(positional, optional)]
+    stop: OptionalArg<PyObjectRef>,
+}
+
+impl OptionalRangeArgs {
+    pub fn saturate(self, len: usize, vm: &VirtualMachine) -> PyResult<(usize, usize)> {
+        let saturate = |obj: PyObjectRef| -> PyResult<_> {
+            obj.try_into_value(vm)
+                .map(|int: PyIntRef| int.as_bigint().saturated_at(len))
+        };
+        let start = self.start.map_or(Ok(0), saturate)?;
+        let stop = self.stop.map_or(Ok(len), saturate)?;
+        Ok((start, stop))
+    }
 }

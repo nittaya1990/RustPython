@@ -2,10 +2,7 @@ pub(crate) use _functools::make_module;
 
 #[pymodule]
 mod _functools {
-    use crate::function::OptionalArg;
-    use crate::protocol::PyIter;
-    use crate::vm::VirtualMachine;
-    use crate::{PyObjectRef, PyResult};
+    use crate::{function::OptionalArg, protocol::PyIter, PyObjectRef, PyResult, VirtualMachine};
 
     #[pyfunction]
     fn reduce(
@@ -19,7 +16,7 @@ mod _functools {
             val
         } else {
             iter.next().transpose()?.ok_or_else(|| {
-                let exc_type = vm.ctx.exceptions.type_error.clone();
+                let exc_type = vm.ctx.exceptions.type_error.to_owned();
                 vm.new_exception_msg(
                     exc_type,
                     "reduce() of empty sequence with no initial value".to_owned(),

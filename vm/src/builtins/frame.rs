@@ -2,36 +2,28 @@
 
 */
 
-use super::{PyCode, PyDictRef, PyStrRef};
+use super::{PyCode, PyDictRef};
 use crate::{
+    class::PyClassImpl,
     frame::{Frame, FrameRef},
-    protocol::PyMapping,
+    function::PySetterValue,
     types::{Constructor, Unconstructible},
-    IdProtocol, PyClassImpl, PyContext, PyObjectRef, PyRef, PyResult, VirtualMachine,
+    AsObject, Context, PyObjectRef, PyRef, PyResult, VirtualMachine,
 };
 
-pub fn init(context: &PyContext) {
-    FrameRef::extend_class(context, &context.types.frame_type);
+pub fn init(context: &Context) {
+    FrameRef::extend_class(context, context.types.frame_type);
 }
 
-#[pyimpl(with(Constructor, PyRef))]
+#[pyclass(with(Constructor, PyRef))]
 impl Frame {}
 impl Unconstructible for Frame {}
 
-#[pyimpl]
+#[pyclass]
 impl FrameRef {
     #[pymethod(magic)]
     fn repr(self) -> String {
         "<frame object at .. >".to_owned()
-    }
-
-    #[pymethod(magic)]
-    fn delattr(self, value: PyStrRef, vm: &VirtualMachine) {
-        // CPython' Frame.f_trace is set to None when deleted.
-        // The strange behavior is mimicked here make bdb.py happy about it.
-        if value.to_string() == "f_trace" {
-            self.set_f_trace(vm.ctx.none());
-        };
     }
 
     #[pymethod]
@@ -39,23 +31,23 @@ impl FrameRef {
         // TODO
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn f_globals(self) -> PyDictRef {
         self.globals.clone()
     }
 
-    #[pyproperty]
-    fn f_locals(self, vm: &VirtualMachine) -> PyResult<PyMapping> {
-        self.locals(vm)
+    #[pygetset]
+    fn f_locals(self, vm: &VirtualMachine) -> PyResult {
+        self.locals(vm).map(Into::into)
     }
 
-    #[pyproperty]
-    fn f_code(self) -> PyRef<PyCode> {
+    #[pygetset]
+    pub fn f_code(self) -> PyRef<PyCode> {
         self.code.clone()
     }
 
-    #[pyproperty]
-    fn f_back(self, vm: &VirtualMachine) -> Option<Self> {
+    #[pygetset]
+    pub fn f_back(self, vm: &VirtualMachine) -> Option<Self> {
         // TODO: actually store f_back inside Frame struct
 
         // get the frame in the frame stack that appears before this one.
@@ -69,25 +61,25 @@ impl FrameRef {
             .cloned()
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn f_lasti(self) -> u32 {
         self.lasti()
     }
 
-    #[pyproperty]
+    #[pygetset]
     pub fn f_lineno(self) -> usize {
         self.current_location().row()
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn f_trace(self) -> PyObjectRef {
         let boxed = self.trace.lock();
         boxed.clone()
     }
 
-    #[pyproperty(setter)]
-    fn set_f_trace(self, value: PyObjectRef) {
+    #[pygetset(setter)]
+    fn set_f_trace(self, value: PySetterValue, vm: &VirtualMachine) {
         let mut storage = self.trace.lock();
-        *storage = value;
+        *storage = value.unwrap_or_none(vm);
     }
 }

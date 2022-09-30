@@ -3,42 +3,42 @@
 //! This module makes use of the parser logic, and translates all ast nodes
 //! into python ast.AST objects.
 
+mod gen;
+
 use crate::{
-    builtins::{self, PyStrRef, PyTypeRef},
-    IdProtocol, ItemProtocol, PyClassImpl, PyContext, PyObject, PyObjectRef, PyResult, PyValue,
-    StaticType, TryFromObject, TypeProtocol, VirtualMachine,
+    builtins::{self, PyStrRef, PyType},
+    class::{PyClassImpl, StaticType},
+    compiler::CompileError,
+    convert::ToPyException,
+    AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyResult, TryFromObject,
+    VirtualMachine,
 };
 use num_complex::Complex64;
 use num_traits::{ToPrimitive, Zero};
 use rustpython_ast as ast;
-#[cfg(feature = "rustpython-compiler")]
-use rustpython_compiler as compile;
+#[cfg(feature = "rustpython-codegen")]
+use rustpython_codegen as codegen;
 #[cfg(feature = "rustpython-parser")]
 use rustpython_parser::parser;
-
-#[rustfmt::skip]
-#[allow(clippy::all)]
-mod gen;
-
 
 #[pymodule]
 mod _ast {
     use crate::{
-        builtins::PyStrRef, function::FuncArgs, PyObjectRef, PyResult, PyValue, TypeProtocol,
+        builtins::PyStrRef, function::FuncArgs, AsObject, PyObjectRef, PyPayload, PyResult,
         VirtualMachine,
     };
     #[pyattr]
     #[pyclass(module = "_ast", name = "AST")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     pub(crate) struct AstNode;
 
-    #[pyimpl(flags(BASETYPE, HAS_DICT))]
+    #[pyclass(flags(BASETYPE, HAS_DICT))]
     impl AstNode {
+        #[pyslot]
         #[pymethod(magic)]
         fn init(zelf: PyObjectRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult<()> {
-            let obj: PyObjectRef = zelf.clone_class().into();
-            let fields = obj.get_attr("_fields", vm)?;
-            let fields = vm.extract_elements::<PyStrRef>(&fields)?;
+            let fields = zelf.get_attr("_fields", vm)?;
+            let fields: Vec<PyStrRef> = fields.try_to_value(vm)?;
             let numargs = args.args.len();
             if numargs > fields.len() {
                 return Err(vm.new_type_error(format!(
@@ -108,7 +108,7 @@ impl<T: Node> Node for Vec<T> {
     }
 
     fn ast_from_object(vm: &VirtualMachine, object: PyObjectRef) -> PyResult<Self> {
-        vm.extract_elements_func(&object, |obj| Node::ast_from_object(vm, obj))
+        vm.extract_elements_with(&object, |obj| Node::ast_from_object(vm, obj))
     }
 }
 
@@ -216,7 +216,7 @@ impl Node for ast::Constant {
         let constant = match_class!(match object {
             ref i @ builtins::int::PyInt => {
                 let value = i.as_bigint();
-                if object.class().is(&vm.ctx.types.bool_type) {
+                if object.class().is(vm.ctx.types.bool_type) {
                     ast::Constant::Bool(!value.is_zero())
                 } else {
                     ast::Constant::Int(value.clone())
@@ -234,15 +234,18 @@ impl Node for ast::Constant {
             ref b @ builtins::bytes::PyBytes => ast::Constant::Bytes(b.as_bytes().to_owned()),
             ref t @ builtins::tuple::PyTuple => {
                 ast::Constant::Tuple(
-                    t.as_slice()
-                        .iter()
+                    t.iter()
                         .map(|elt| Self::ast_from_object(vm, elt.clone()))
                         .collect::<Result<_, _>>()?,
                 )
             }
             builtins::singletons::PyNone => ast::Constant::None,
             builtins::slice::PyEllipsis => ast::Constant::Ellipsis,
-            _ => return Err(vm.new_type_error("unsupported type for constant".to_owned())),
+            obj =>
+                return Err(vm.new_type_error(format!(
+                    "invalid type in Constant: type '{}'",
+                    obj.class().name()
+                ))),
         });
         Ok(constant)
     }
@@ -255,32 +258,35 @@ impl Node for ast::ConversionFlag {
 
     fn ast_from_object(vm: &VirtualMachine, object: PyObjectRef) -> PyResult<Self> {
         i32::try_from_object(vm, object)?
-            .to_u8()
-            .and_then(ast::ConversionFlag::try_from_byte)
+            .to_usize()
+            .and_then(|f| f.try_into().ok())
             .ok_or_else(|| vm.new_value_error("invalid conversion flag".to_owned()))
     }
 }
 
 #[cfg(feature = "rustpython-parser")]
-pub(crate) fn parse(vm: &VirtualMachine, source: &str, mode: parser::Mode) -> PyResult {
-    // TODO: use vm.new_syntax_error()
-    let top = parser::parse(source, mode).map_err(|err| vm.new_value_error(format!("{}", err)))?;
+pub(crate) fn parse(
+    vm: &VirtualMachine,
+    source: &str,
+    mode: parser::Mode,
+) -> Result<PyObjectRef, CompileError> {
+    let top =
+        parser::parse(source, mode, "<unknown>").map_err(|err| CompileError::from(err, source))?;
     Ok(top.ast_to_object(vm))
 }
 
-#[cfg(feature = "rustpython-compiler")]
+#[cfg(feature = "rustpython-codegen")]
 pub(crate) fn compile(
     vm: &VirtualMachine,
     object: PyObjectRef,
     filename: &str,
-    _mode: compile::Mode,
+    mode: codegen::compile::Mode,
 ) -> PyResult {
     let opts = vm.compile_opts();
     let ast = Node::ast_from_object(vm, object)?;
-    let code = rustpython_compiler_core::compile::compile_top(&ast, filename.to_owned(), opts)
-        // TODO: use vm.new_syntax_error()
-        .map_err(|err| vm.new_value_error(err.to_string()))?;
-    Ok(vm.new_code_object(code).into())
+    let code = codegen::compile::compile_top(&ast, filename.to_owned(), mode, opts)
+        .map_err(|err| CompileError::from(err, "<unknown>").to_pyexception(vm))?; // FIXME source
+    Ok(vm.ctx.new_code(code).into())
 }
 
 // Required crate visibility for inclusion by gen.rs

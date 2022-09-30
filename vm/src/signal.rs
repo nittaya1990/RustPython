@@ -1,8 +1,12 @@
 #![cfg_attr(target_os = "wasi", allow(dead_code))]
 use crate::{PyResult, VirtualMachine};
-use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::{
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+};
 
 pub(crate) const NSIG: usize = 64;
 static ANY_TRIGGERED: AtomicBool = AtomicBool::new(false);
@@ -49,6 +53,33 @@ fn trigger_signals(vm: &VirtualMachine) -> PyResult<()> {
 
 pub(crate) fn set_triggered() {
     ANY_TRIGGERED.store(true, Ordering::Release);
+}
+
+pub fn assert_in_range(signum: i32, vm: &VirtualMachine) -> PyResult<()> {
+    if (1..NSIG as i32).contains(&signum) {
+        Ok(())
+    } else {
+        Err(vm.new_value_error("signal number out of range".to_owned()))
+    }
+}
+
+/// Similar to `PyErr_SetInterruptEx` in CPython
+///
+/// Missing signal handler for the given signal number is silently ignored.
+#[allow(dead_code)]
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_interrupt_ex(signum: i32, vm: &VirtualMachine) -> PyResult<()> {
+    use crate::stdlib::signal::_signal::{run_signal, SIG_DFL, SIG_IGN};
+    assert_in_range(signum, vm)?;
+
+    match signum as usize {
+        SIG_DFL | SIG_IGN => Ok(()),
+        _ => {
+            // interrupt the main thread with given signal number
+            run_signal(signum);
+            Ok(())
+        }
+    }
 }
 
 pub type UserSignal = Box<dyn FnOnce(&VirtualMachine) -> PyResult<()> + Send>;

@@ -7,16 +7,16 @@ use crate::{
     function::ArgIntoFloat,
     protocol::PyBuffer,
     stdlib::builtins,
-    ItemProtocol, PyObjectRef, PyResult, TryFromBorrowedObject, TryFromObject, TypeProtocol,
-    VirtualMachine,
+    AsObject, PyObjectRef, PyResult, TryFromBorrowedObject, TryFromObject, VirtualMachine,
 };
 use itertools::Itertools;
 use num_bigint::{BigInt, Sign};
-use num_traits::cast::ToPrimitive;
-use num_traits::Signed;
-use std::iter::{Enumerate, Peekable};
-use std::str::FromStr;
-use std::{cmp, fmt};
+use num_traits::{cast::ToPrimitive, Signed};
+use std::{
+    cmp, fmt,
+    iter::{Enumerate, Peekable},
+    str::FromStr,
+};
 
 #[derive(Debug, PartialEq)]
 enum CFormatErrorType {
@@ -141,7 +141,7 @@ impl CFormatSpec {
         let precision = parse_precision(iter)?;
         consume_length(iter);
         let (format_type, format_char) = parse_format_type(iter)?;
-        let precision = precision.or_else(|| match format_type {
+        let precision = precision.or(match format_type {
             CFormatType::Float(_) => Some(CFormatQuantity::Amount(6)),
             _ => None,
         });
@@ -348,12 +348,13 @@ impl CFormatSpec {
                     magnitude,
                     case,
                     self.flags.contains(CConversionFlags::ALTERNATE_FORM),
+                    false,
                 )
             }
             _ => unreachable!(),
         };
 
-        let formatted = if self.flags.contains(CConversionFlags::ZERO_PAD) {
+        if self.flags.contains(CConversionFlags::ZERO_PAD) {
             let fill_char = if !self.flags.contains(CConversionFlags::LEFT_ADJUST) {
                 '0'
             } else {
@@ -376,9 +377,7 @@ impl CFormatSpec {
                 None,
                 false,
             )
-        };
-
-        formatted
+        }
     }
 
     fn bytes_format(&self, vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Vec<u8>> {
@@ -395,7 +394,7 @@ impl CFormatSpec {
                         Ok(buffer.contiguous_or_collect(|bytes| self.format_bytes(bytes)))
                     } else {
                         let bytes = vm
-                            .get_special_method(obj, "__bytes__")?
+                            .get_special_method(obj, identifier!(vm, __bytes__))?
                             .map_err(|obj| {
                                 vm.new_type_error(format!(
                                     "%b requires a bytes-like object, or an object that \
@@ -420,7 +419,7 @@ impl CFormatSpec {
                             .into_bytes())
                     }
                     obj => {
-                        if let Some(method) = vm.get_method(obj.clone(), "__int__") {
+                        if let Some(method) = vm.get_method(obj.clone(), identifier!(vm, __int__)) {
                             let result = vm.invoke(&method?, ())?;
                             if let Some(i) = result.payload::<PyInt>() {
                                 return Ok(self.format_number(i.as_bigint()).into_bytes());
@@ -447,18 +446,16 @@ impl CFormatSpec {
             },
             CFormatType::Float(_) => {
                 let type_name = obj.class().name().to_string();
-                let value = ArgIntoFloat::try_from_object(vm, obj)
-                    .map_err(|e| {
-                        if e.isinstance(&vm.ctx.exceptions.type_error) {
-                            // formatfloat in bytesobject.c generates its own specific exception
-                            // text in this case, mirror it here.
-                            vm.new_type_error(format!("float argument required, not {}", type_name))
-                        } else {
-                            e
-                        }
-                    })?
-                    .to_f64();
-                Ok(self.format_float(value).into_bytes())
+                let value = ArgIntoFloat::try_from_object(vm, obj).map_err(|e| {
+                    if e.fast_isinstance(vm.ctx.exceptions.type_error) {
+                        // formatfloat in bytesobject.c generates its own specific exception
+                        // text in this case, mirror it here.
+                        vm.new_type_error(format!("float argument required, not {}", type_name))
+                    } else {
+                        e
+                    }
+                })?;
+                Ok(self.format_float(value.into()).into_bytes())
             }
             CFormatType::Character => {
                 if let Some(i) = obj.payload::<PyInt>() {
@@ -516,7 +513,7 @@ impl CFormatSpec {
                         Ok(self.format_number(&try_f64_to_bigint(f.to_f64(), vm)?))
                     }
                     obj => {
-                        if let Some(method) = vm.get_method(obj.clone(), "__int__") {
+                        if let Some(method) = vm.get_method(obj.clone(), identifier!(vm, __int__)) {
                             let result = vm.invoke(&method?, ())?;
                             if let Some(i) = result.payload::<PyInt>() {
                                 return Ok(self.format_number(i.as_bigint()));
@@ -542,8 +539,8 @@ impl CFormatSpec {
                 }
             },
             CFormatType::Float(_) => {
-                let value = ArgIntoFloat::try_from_object(vm, obj)?.to_f64();
-                Ok(self.format_float(value))
+                let value = ArgIntoFloat::try_from_object(vm, obj)?;
+                Ok(self.format_float(value.into()))
             }
             CFormatType::Character => {
                 if let Some(i) = obj.payload::<PyInt>() {
@@ -600,8 +597,8 @@ fn try_update_quantity_from_tuple<'a, I: Iterator<Item = &'a PyObjectRef>>(
         Some(CFormatQuantity::FromValuesTuple) => match elements.next() {
             Some(width_obj) => {
                 if let Some(i) = width_obj.payload::<PyInt>() {
-                    let i = i.try_to_primitive::<i32>(vm)?.abs() as usize;
-                    *q = Some(CFormatQuantity::Amount(i));
+                    let i = i.try_to_primitive::<i32>(vm)?.unsigned_abs();
+                    *q = Some(CFormatQuantity::Amount(i as usize));
                     Ok(())
                 } else {
                     Err(vm.new_type_error("* wants int".to_owned()))
@@ -688,20 +685,20 @@ impl CFormatBytes {
         vm: &VirtualMachine,
         values_obj: PyObjectRef,
     ) -> PyResult<Vec<u8>> {
-        let (num_specifiers, mapping_required) = check_specifiers(self.parts.as_slice(), vm)?;
+        let (num_specifiers, mapping_required) = check_specifiers(&self.parts, vm)?;
         let mut result = vec![];
 
-        let is_mapping = values_obj.class().has_attr("__getitem__")
-            && !values_obj.isinstance(&vm.ctx.types.tuple_type)
-            && !values_obj.isinstance(&vm.ctx.types.bytes_type)
-            && !values_obj.isinstance(&vm.ctx.types.bytearray_type);
+        let is_mapping = values_obj.class().has_attr(identifier!(vm, __getitem__))
+            && !values_obj.fast_isinstance(vm.ctx.types.tuple_type)
+            && !values_obj.fast_isinstance(vm.ctx.types.bytes_type)
+            && !values_obj.fast_isinstance(vm.ctx.types.bytearray_type);
 
         if num_specifiers == 0 {
             // literal only
             return if is_mapping
                 || values_obj
                     .payload::<tuple::PyTuple>()
-                    .map_or(false, |e| e.as_slice().is_empty())
+                    .map_or(false, |e| e.is_empty())
             {
                 for (_, part) in &mut self.parts {
                     match part {
@@ -725,7 +722,7 @@ impl CFormatBytes {
                         CFormatPart::Literal(literal) => result.append(literal),
                         CFormatPart::Spec(spec) => {
                             let value = match &spec.mapping_key {
-                                Some(key) => values_obj.get_item(key, vm)?,
+                                Some(key) => values_obj.get_item(key.as_str(), vm)?,
                                 None => unreachable!(),
                             };
                             let mut part_result = spec.bytes_format(vm, value)?;
@@ -840,19 +837,19 @@ impl CFormatString {
         vm: &VirtualMachine,
         values_obj: PyObjectRef,
     ) -> PyResult<String> {
-        let (num_specifiers, mapping_required) = check_specifiers(self.parts.as_slice(), vm)?;
+        let (num_specifiers, mapping_required) = check_specifiers(&self.parts, vm)?;
         let mut result = String::new();
 
-        let is_mapping = values_obj.class().has_attr("__getitem__")
-            && !values_obj.isinstance(&vm.ctx.types.tuple_type)
-            && !values_obj.isinstance(&vm.ctx.types.str_type);
+        let is_mapping = values_obj.class().has_attr(identifier!(vm, __getitem__))
+            && !values_obj.fast_isinstance(vm.ctx.types.tuple_type)
+            && !values_obj.fast_isinstance(vm.ctx.types.str_type);
 
         if num_specifiers == 0 {
             // literal only
             return if is_mapping
                 || values_obj
                     .payload::<tuple::PyTuple>()
-                    .map_or(false, |e| e.as_slice().is_empty())
+                    .map_or(false, |e| e.is_empty())
             {
                 for (_, part) in &self.parts {
                     match part {
@@ -876,7 +873,7 @@ impl CFormatString {
                         CFormatPart::Literal(literal) => result.push_str(literal),
                         CFormatPart::Spec(spec) => {
                             let value = match &spec.mapping_key {
-                                Some(key) => values_obj.get_item(key, vm)?,
+                                Some(key) => values_obj.get_item(key.as_str(), vm)?,
                                 None => unreachable!(),
                             };
                             let part_result = spec.string_format(vm, value, idx)?;
@@ -954,7 +951,7 @@ where
                     break;
                 }
             }
-            return Ok(Some(CFormatQuantity::Amount(num.abs() as usize)));
+            return Ok(Some(CFormatQuantity::Amount(num.unsigned_abs() as usize)));
         }
     }
     Ok(None)

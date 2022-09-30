@@ -1,9 +1,9 @@
 use crate::{
-    builtins::{float, int, pybool, PyBaseExceptionRef, PyDictRef, PyFunction, PyStrRef},
+    builtins::{bool_, float, int, PyBaseExceptionRef, PyDictRef, PyFunction, PyStrInterned},
     bytecode::CodeFlags,
-    function::{FuncArgs, IntoPyObject},
-    IdProtocol, ItemProtocol, PyObject, PyObjectRef, PyResult, TryFromObject, TypeProtocol,
-    VirtualMachine,
+    convert::ToPyObject,
+    function::FuncArgs,
+    AsObject, PyObject, PyObjectRef, PyResult, TryFromObject, VirtualMachine,
 };
 use num_traits::ToPrimitive;
 use rustpython_jit::{AbiValue, Args, CompiledCode, JitArgumentError, JitType};
@@ -26,28 +26,29 @@ pub enum ArgsError {
     JitError(#[from] JitArgumentError),
 }
 
-impl IntoPyObject for AbiValue {
-    fn into_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
+impl ToPyObject for AbiValue {
+    fn to_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
         match self {
-            AbiValue::Int(i) => i.into_pyobject(vm),
-            AbiValue::Float(f) => f.into_pyobject(vm),
-            AbiValue::Bool(b) => b.into_pyobject(vm),
+            AbiValue::Int(i) => i.to_pyobject(vm),
+            AbiValue::Float(f) => f.to_pyobject(vm),
+            AbiValue::Bool(b) => b.to_pyobject(vm),
+            _ => unimplemented!(),
         }
     }
 }
 
 pub fn new_jit_error(msg: String, vm: &VirtualMachine) -> PyBaseExceptionRef {
-    let jit_error = vm.ctx.exceptions.jit_error.clone();
+    let jit_error = vm.ctx.exceptions.jit_error.to_owned();
     vm.new_exception_msg(jit_error, msg)
 }
 
 fn get_jit_arg_type(dict: &PyDictRef, name: &str, vm: &VirtualMachine) -> PyResult<JitType> {
-    if let Some(value) = dict.get_item_option(name, vm)? {
-        if value.is(&vm.ctx.types.int_type) {
+    if let Some(value) = dict.get_item_opt(name, vm)? {
+        if value.is(vm.ctx.types.int_type) {
             Ok(JitType::Int)
-        } else if value.is(&vm.ctx.types.float_type) {
+        } else if value.is(vm.ctx.types.float_type) {
             Ok(JitType::Float)
-        } else if value.is(&vm.ctx.types.bool_type) {
+        } else if value.is(vm.ctx.types.bool_type) {
             Ok(JitType::Bool)
         } else {
             Err(new_jit_error(
@@ -64,7 +65,7 @@ fn get_jit_arg_type(dict: &PyDictRef, name: &str, vm: &VirtualMachine) -> PyResu
 }
 
 pub fn get_jit_arg_types(
-    func: &crate::PyObjectView<PyFunction>,
+    func: &crate::Py<PyFunction>,
     vm: &VirtualMachine,
 ) -> PyResult<Vec<JitType>> {
     let arg_names = func.code.arg_names();
@@ -111,15 +112,15 @@ pub fn get_jit_arg_types(
 fn get_jit_value(vm: &VirtualMachine, obj: &PyObject) -> Result<AbiValue, ArgsError> {
     // This does exact type checks as subclasses of int/float can't be passed to jitted functions
     let cls = obj.class();
-    if cls.is(&vm.ctx.types.int_type) {
+    if cls.is(vm.ctx.types.int_type) {
         int::get_value(obj)
             .to_i64()
             .map(AbiValue::Int)
             .ok_or(ArgsError::IntOverflow)
-    } else if cls.is(&vm.ctx.types.float_type) {
+    } else if cls.is(vm.ctx.types.float_type) {
         Ok(AbiValue::Float(float::get_value(obj)))
-    } else if cls.is(&vm.ctx.types.bool_type) {
-        Ok(AbiValue::Bool(pybool::get_value(obj)))
+    } else if cls.is(vm.ctx.types.bool_type) {
+        Ok(AbiValue::Bool(bool_::get_value(obj)))
     } else {
         Err(ArgsError::NonJitType)
     }
@@ -152,7 +153,7 @@ pub(crate) fn get_jit_args<'a>(
     // Handle keyword arguments
     for (name, value) in &func_args.kwargs {
         let arg_pos =
-            |args: &[PyStrRef], name: &str| args.iter().position(|arg| arg.as_str() == name);
+            |args: &[&PyStrInterned], name: &str| args.iter().position(|arg| arg.as_str() == name);
         if let Some(arg_idx) = arg_pos(arg_names.args, name) {
             if jit_args.is_set(arg_idx) {
                 return Err(ArgsError::ArgPassedMultipleTimes);
@@ -173,7 +174,6 @@ pub(crate) fn get_jit_args<'a>(
 
     // fill in positional defaults
     if let Some(defaults) = defaults {
-        let defaults = defaults.as_slice();
         for (i, default) in defaults.iter().enumerate() {
             let arg_idx = i + func.code.arg_count - defaults.len();
             if !jit_args.is_set(arg_idx) {
@@ -188,7 +188,7 @@ pub(crate) fn get_jit_args<'a>(
             let arg_idx = i + func.code.arg_count;
             if !jit_args.is_set(arg_idx) {
                 let default = kw_only_defaults
-                    .get_item(name.clone(), vm)
+                    .get_item(&**name, vm)
                     .map_err(|_| ArgsError::NotAllArgsPassed)
                     .and_then(|obj| get_jit_value(vm, &obj))?;
                 jit_args.set(arg_idx, default)?;

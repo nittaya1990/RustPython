@@ -51,9 +51,15 @@ mod lock {
 #[pymodule]
 mod _imp {
     use crate::{
-        builtins::{PyBytesRef, PyCode, PyModule, PyStr, PyStrRef},
-        import, ItemProtocol, PyObjectRef, PyRef, PyResult, PyValue, TryFromObject, VirtualMachine,
+        builtins::{PyBytesRef, PyCode, PyModule, PyStrRef},
+        import, PyObjectRef, PyRef, PyResult, TryFromObject, VirtualMachine,
     };
+
+    #[pyattr]
+    fn check_hash_based_pycs(vm: &VirtualMachine) -> PyStrRef {
+        vm.ctx
+            .new_str(vm.state.settings.check_hash_based_pycs.clone())
+    }
 
     #[pyfunction]
     fn extension_suffixes() -> PyResult<Vec<PyObjectRef>> {
@@ -72,11 +78,11 @@ mod _imp {
 
     #[pyfunction]
     fn create_builtin(spec: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        let sys_modules = vm.sys_module.clone().get_attr("modules", vm).unwrap();
+        let sys_modules = vm.sys_module.get_attr("modules", vm).unwrap();
         let name = spec.get_attr("name", vm)?;
         let name = PyStrRef::try_from_object(vm, name)?;
 
-        if let Ok(module) = sys_modules.get_item(name.clone(), vm) {
+        if let Ok(module) = sys_modules.get_item(&*name, vm) {
             Ok(module)
         } else if let Some(make_module_func) = vm.state.module_inits.get(name.as_str()) {
             Ok(make_module_func(vm))
@@ -92,18 +98,8 @@ mod _imp {
     }
 
     #[pyfunction]
-    fn get_frozen_object(name: PyStrRef, vm: &VirtualMachine) -> PyResult<PyCode> {
-        vm.state
-            .frozen
-            .get(name.as_str())
-            .map(|frozen| {
-                let mut frozen = frozen.code.clone();
-                frozen.source_path = PyStr::from(format!("frozen {}", name)).into_ref(vm);
-                PyCode::new(frozen)
-            })
-            .ok_or_else(|| {
-                vm.new_import_error(format!("No such frozen object named {}", name), name)
-            })
+    fn get_frozen_object(name: PyStrRef, vm: &VirtualMachine) -> PyResult<PyRef<PyCode>> {
+        import::make_frozen(vm, name.as_str())
     }
 
     #[pyfunction]
@@ -128,8 +124,8 @@ mod _imp {
     }
 
     #[pyfunction]
-    fn source_hash(_key: u64, _source: PyBytesRef, vm: &VirtualMachine) -> PyResult {
-        // TODO:
-        Ok(vm.ctx.none())
+    fn source_hash(key: u64, source: PyBytesRef) -> Vec<u8> {
+        let hash: u64 = crate::common::hash::keyed_hash(key, source.as_bytes());
+        hash.to_le_bytes().to_vec()
     }
 }

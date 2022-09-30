@@ -10,10 +10,14 @@ import threading
 import warnings
 
 import unittest
+from unittest import mock
 TestCase = unittest.TestCase
 
 from test import support
 from test.support import os_helper
+from test.support import socket_helper
+from test.support import warnings_helper
+
 
 here = os.path.dirname(__file__)
 # Self-signed cert file for 'localhost'
@@ -43,7 +47,7 @@ last_chunk_extended = "0" + chunk_extension + "\r\n"
 trailers = "X-Dummy: foo\r\nX-Dumm2: bar\r\n"
 chunked_end = "\r\n"
 
-HOST = support.HOST
+HOST = socket_helper.HOST
 
 class FakeSocket:
     def __init__(self, text, fileclass=io.BytesIO, host=None, port=None):
@@ -347,8 +351,6 @@ class HeaderTests(TestCase):
                 with self.assertRaisesRegex(ValueError, 'Invalid header'):
                     conn.putheader(name, value)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_headers_debuglevel(self):
         body = (
             b'HTTP/1.1 200 OK\r\n'
@@ -368,8 +370,6 @@ class HeaderTests(TestCase):
 
 
 class HttpMethodTests(TestCase):
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_invalid_method_names(self):
         methods = (
             'GET\r',
@@ -599,6 +599,33 @@ class BasicTest(TestCase):
         resp.close()
         self.assertTrue(resp.closed)
 
+    def test_partial_reads_past_end(self):
+        # if we have Content-Length, clip reads to the end
+        body = "HTTP/1.1 200 Ok\r\nContent-Length: 4\r\n\r\nText"
+        sock = FakeSocket(body)
+        resp = client.HTTPResponse(sock)
+        resp.begin()
+        self.assertEqual(resp.read(10), b'Text')
+        self.assertTrue(resp.isclosed())
+        self.assertFalse(resp.closed)
+        resp.close()
+        self.assertTrue(resp.closed)
+
+    def test_partial_readintos_past_end(self):
+        # if we have Content-Length, clip readintos to the end
+        body = "HTTP/1.1 200 Ok\r\nContent-Length: 4\r\n\r\nText"
+        sock = FakeSocket(body)
+        resp = client.HTTPResponse(sock)
+        resp.begin()
+        b = bytearray(10)
+        n = resp.readinto(b)
+        self.assertEqual(n, 4)
+        self.assertEqual(bytes(b)[:4], b'Text')
+        self.assertTrue(resp.isclosed())
+        self.assertFalse(resp.closed)
+        resp.close()
+        self.assertTrue(resp.closed)
+
     def test_partial_reads_no_content_length(self):
         # when no length is present, the socket should be gracefully closed when
         # all data was read
@@ -806,8 +833,6 @@ class BasicTest(TestCase):
         conn.request('GET', '/foo', body(), {'Content-Length': '11'})
         self.assertEqual(sock.data, expected)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_blocksize_request(self):
         """Check that request() respects the configured block size."""
         blocksize = 8  # For easy debugging.
@@ -820,8 +845,6 @@ class BasicTest(TestCase):
         body = sock.data.split(b"\r\n\r\n", 1)[1]
         self.assertEqual(body, expected)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_blocksize_send(self):
         """Check that send() respects the configured block size."""
         blocksize = 8  # For easy debugging.
@@ -1011,6 +1034,19 @@ class BasicTest(TestCase):
         )
         resp = client.HTTPResponse(FakeSocket(body))
         self.assertRaises(client.LineTooLong, resp.begin)
+
+    def test_overflowing_header_limit_after_100(self):
+        body = (
+            'HTTP/1.1 100 OK\r\n'
+            'r\n' * 32768
+        )
+        resp = client.HTTPResponse(FakeSocket(body))
+        with self.assertRaises(client.HTTPException) as cm:
+            resp.begin()
+        # We must assert more because other reasonable errors that we
+        # do not want can also be HTTPException derived.
+        self.assertIn('got more than ', str(cm.exception))
+        self.assertIn('headers', str(cm.exception))
 
     def test_overflowing_chunked_line(self):
         body = (
@@ -1214,8 +1250,6 @@ class BasicTest(TestCase):
         # invalid URL as the value of the "Host:" header
         conn.putrequest('GET', '/', skip_host=1)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_putrequest_override_encoding(self):
         """
         It should be possible to override the default encoding
@@ -1415,12 +1449,12 @@ class Readliner:
 class OfflineTest(TestCase):
     def test_all(self):
         # Documented objects defined in the module should be in __all__
-        expected = {"responses"}  # White-list documented dict() object
+        expected = {"responses"}  # Allowlist documented dict() object
         # HTTPMessage, parse_headers(), and the HTTP status code constants are
         # intentionally omitted for simplicity
-        blacklist = {"HTTPMessage", "parse_headers"}
+        denylist = {"HTTPMessage", "parse_headers"}
         for name in dir(client):
-            if name.startswith("_") or name in blacklist:
+            if name.startswith("_") or name in denylist:
                 continue
             module_object = getattr(client, name)
             if getattr(module_object, "__module__", None) == "http.client":
@@ -1430,8 +1464,6 @@ class OfflineTest(TestCase):
     def test_responses(self):
         self.assertEqual(client.responses[client.NOT_FOUND], "Not Found")
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_client_constants(self):
         # Make sure we don't break backward compatibility with 3.4
         expected = [
@@ -1472,6 +1504,7 @@ class OfflineTest(TestCase):
             'UNSUPPORTED_MEDIA_TYPE',
             'REQUESTED_RANGE_NOT_SATISFIABLE',
             'EXPECTATION_FAILED',
+            'IM_A_TEAPOT',
             'MISDIRECTED_REQUEST',
             'UNPROCESSABLE_ENTITY',
             'LOCKED',
@@ -1490,6 +1523,8 @@ class OfflineTest(TestCase):
             'INSUFFICIENT_STORAGE',
             'NOT_EXTENDED',
             'NETWORK_AUTHENTICATION_REQUIRED',
+            'EARLY_HINTS',
+            'TOO_EARLY'
         ]
         for const in expected:
             with self.subTest(constant=const):
@@ -1499,8 +1534,8 @@ class OfflineTest(TestCase):
 class SourceAddressTest(TestCase):
     def setUp(self):
         self.serv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.port = support.bind_port(self.serv)
-        self.source_port = support.find_unused_port()
+        self.port = socket_helper.bind_port(self.serv)
+        self.source_port = socket_helper.find_unused_port()
         self.serv.listen()
         self.conn = None
 
@@ -1532,7 +1567,7 @@ class TimeoutTest(TestCase):
 
     def setUp(self):
         self.serv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        TimeoutTest.PORT = support.bind_port(self.serv)
+        TimeoutTest.PORT = socket_helper.bind_port(self.serv)
         self.serv.listen()
 
     def tearDown(self):
@@ -1645,7 +1680,6 @@ class PersistenceTest(TestCase):
         self.assertEqual(conn.connections, 2)
 
 
-@unittest.skip("TODO: RUSTPYTHON")
 class HTTPSTest(TestCase):
 
     def setUp(self):
@@ -1661,11 +1695,13 @@ class HTTPSTest(TestCase):
         h = client.HTTPSConnection(HOST, TimeoutTest.PORT, timeout=30)
         self.assertEqual(h.timeout, 30)
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_networked(self):
         # Default settings: requires a valid cert from a trusted CA
         import ssl
         support.requires('network')
-        with support.transient_internet('self-signed.pythontest.net'):
+        with socket_helper.transient_internet('self-signed.pythontest.net'):
             h = client.HTTPSConnection('self-signed.pythontest.net', 443)
             with self.assertRaises(ssl.SSLError) as exc_info:
                 h.request('GET', '/')
@@ -1675,7 +1711,7 @@ class HTTPSTest(TestCase):
         # Switch off cert verification
         import ssl
         support.requires('network')
-        with support.transient_internet('self-signed.pythontest.net'):
+        with socket_helper.transient_internet('self-signed.pythontest.net'):
             context = ssl._create_unverified_context()
             h = client.HTTPSConnection('self-signed.pythontest.net', 443,
                                        context=context)
@@ -1689,7 +1725,7 @@ class HTTPSTest(TestCase):
     def test_networked_trusted_by_default_cert(self):
         # Default settings: requires a valid cert from a trusted CA
         support.requires('network')
-        with support.transient_internet('www.python.org'):
+        with socket_helper.transient_internet('www.python.org'):
             h = client.HTTPSConnection('www.python.org', 443)
             h.request('GET', '/')
             resp = h.getresponse()
@@ -1698,12 +1734,14 @@ class HTTPSTest(TestCase):
             h.close()
             self.assertIn('text/html', content_type)
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_networked_good_cert(self):
         # We feed the server's cert as a validating cert
         import ssl
         support.requires('network')
         selfsigned_pythontestdotnet = 'self-signed.pythontest.net'
-        with support.transient_internet(selfsigned_pythontestdotnet):
+        with socket_helper.transient_internet(selfsigned_pythontestdotnet):
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
             self.assertEqual(context.check_hostname, True)
@@ -1731,11 +1769,13 @@ class HTTPSTest(TestCase):
             h.close()
             self.assertIn('nginx', server_string)
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_networked_bad_cert(self):
         # We feed a "CA" cert that is unrelated to the server's cert
         import ssl
         support.requires('network')
-        with support.transient_internet('self-signed.pythontest.net'):
+        with socket_helper.transient_internet('self-signed.pythontest.net'):
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             context.load_verify_locations(CERT_localhost)
             h = client.HTTPSConnection('self-signed.pythontest.net', 443, context=context)
@@ -1743,6 +1783,8 @@ class HTTPSTest(TestCase):
                 h.request('GET', '/')
             self.assertEqual(exc_info.exception.reason, 'CERTIFICATE_VERIFY_FAILED')
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_local_unknown_cert(self):
         # The custom cert isn't known to the default trust bundle
         import ssl
@@ -1765,6 +1807,8 @@ class HTTPSTest(TestCase):
         self.addCleanup(resp.close)
         self.assertEqual(resp.status, 404)
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_local_bad_hostname(self):
         # The (valid) cert doesn't validate the HTTP hostname
         import ssl
@@ -1775,14 +1819,14 @@ class HTTPSTest(TestCase):
         with self.assertRaises(ssl.CertificateError):
             h.request('GET', '/')
         # Same with explicit check_hostname=True
-        with support.check_warnings(('', DeprecationWarning)):
+        with warnings_helper.check_warnings(('', DeprecationWarning)):
             h = client.HTTPSConnection('localhost', server.port,
                                        context=context, check_hostname=True)
         with self.assertRaises(ssl.CertificateError):
             h.request('GET', '/')
         # With check_hostname=False, the mismatching is ignored
         context.check_hostname = False
-        with support.check_warnings(('', DeprecationWarning)):
+        with warnings_helper.check_warnings(('', DeprecationWarning)):
             h = client.HTTPSConnection('localhost', server.port,
                                        context=context, check_hostname=False)
         h.request('GET', '/nonexistent')
@@ -1801,7 +1845,7 @@ class HTTPSTest(TestCase):
         h.close()
         # Passing check_hostname to HTTPSConnection should override the
         # context's setting.
-        with support.check_warnings(('', DeprecationWarning)):
+        with warnings_helper.check_warnings(('', DeprecationWarning)):
             h = client.HTTPSConnection('localhost', server.port,
                                        context=context, check_hostname=True)
         with self.assertRaises(ssl.CertificateError):
@@ -1918,9 +1962,9 @@ class RequestBodyTest(TestCase):
 
     def test_text_file_body(self):
         self.addCleanup(os_helper.unlink, os_helper.TESTFN)
-        with open(os_helper.TESTFN, "w") as f:
+        with open(os_helper.TESTFN, "w", encoding="utf-8") as f:
             f.write("body")
-        with open(os_helper.TESTFN) as f:
+        with open(os_helper.TESTFN, encoding="utf-8") as f:
             self.conn.request("PUT", "/url", f)
             message, f = self.get_headers_and_fp()
             self.assertEqual("text/plain", message.get_content_type())
@@ -2030,6 +2074,23 @@ class TunnelTests(TestCase):
 
         # This test should be removed when CONNECT gets the HTTP/1.1 blessing
         self.assertNotIn(b'Host: proxy.com', self.conn.sock.data)
+
+    def test_tunnel_connect_single_send_connection_setup(self):
+        """Regresstion test for https://bugs.python.org/issue43332."""
+        with mock.patch.object(self.conn, 'send') as mock_send:
+            self.conn.set_tunnel('destination.com')
+            self.conn.connect()
+            self.conn.request('GET', '/')
+        mock_send.assert_called()
+        # Likely 2, but this test only cares about the first.
+        self.assertGreater(
+                len(mock_send.mock_calls), 1,
+                msg=f'unexpected number of send calls: {mock_send.mock_calls}')
+        proxy_setup_data_sent = mock_send.mock_calls[0][1][0]
+        self.assertIn(b'CONNECT destination.com', proxy_setup_data_sent)
+        self.assertTrue(
+                proxy_setup_data_sent.endswith(b'\r\n\r\n'),
+                msg=f'unexpected proxy data sent {proxy_setup_data_sent!r}')
 
     def test_connect_put_request(self):
         self.conn.set_tunnel('destination.com')

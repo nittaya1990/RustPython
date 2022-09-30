@@ -1,19 +1,19 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::{Rc, Weak};
-
+use crate::{
+    browser_module::setup_browser_module,
+    convert::{self, PyResultExt},
+    js_module, wasm_builtins,
+};
 use js_sys::{Object, TypeError};
+use rustpython_vm::{
+    builtins::PyWeak, compiler::Mode, scope::Scope, Interpreter, PyObjectRef, PyPayload, PyRef,
+    PyResult, Settings, VirtualMachine,
+};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::{Rc, Weak},
+};
 use wasm_bindgen::prelude::*;
-
-use rustpython_vm::compile::{self, Mode};
-use rustpython_vm::scope::Scope;
-use rustpython_vm::{InitParameter, Interpreter, PySettings, VirtualMachine};
-use rustpython_vm::{ItemProtocol, PyObjectRef, PyObjectWeak, PyValue};
-
-use crate::browser_module::setup_browser_module;
-use crate::convert::{self, PyResultExt};
-use crate::js_module;
-use crate::wasm_builtins;
 
 pub(crate) struct StoredVirtualMachine {
     pub interp: Interpreter,
@@ -39,7 +39,15 @@ fn init_window_module(vm: &VirtualMachine) -> PyObjectRef {
 impl StoredVirtualMachine {
     fn new(id: String, inject_browser_module: bool) -> StoredVirtualMachine {
         let mut scope = None;
-        let interp = Interpreter::new_with_init(PySettings::default(), |vm| {
+        let mut settings = Settings::default();
+        settings.allow_external_library = false;
+        let interp = Interpreter::with_init(settings, |vm| {
+            #[cfg(feature = "stdlib")]
+            vm.add_native_modules(rustpython_stdlib::get_module_inits());
+
+            #[cfg(feature = "freeze-stdlib")]
+            vm.add_frozen(rustpython_pylib::frozen_stdlib());
+
             vm.wasm_id = Some(id);
 
             js_module::setup_js_module(vm);
@@ -55,8 +63,6 @@ impl StoredVirtualMachine {
             });
 
             scope = Some(vm.new_scope_with_builtins());
-
-            InitParameter::Internal
         });
 
         StoredVirtualMachine {
@@ -195,11 +201,14 @@ impl WASMVirtualMachine {
         STORED_VMS.with(|cell| cell.borrow().contains_key(&self.id))
     }
 
-    pub(crate) fn push_held_rc(&self, obj: PyObjectRef) -> Result<PyObjectWeak, JsValue> {
-        self.with(|stored_vm| {
-            let weak = obj.downgrade();
+    pub(crate) fn push_held_rc(
+        &self,
+        obj: PyObjectRef,
+    ) -> Result<PyResult<PyRef<PyWeak>>, JsValue> {
+        self.with_vm(|vm, stored_vm| {
+            let weak = obj.downgrade(None, vm)?;
             stored_vm.held_objects.borrow_mut().push(obj);
-            weak
+            Ok(weak)
         })
     }
 
@@ -224,7 +233,7 @@ impl WASMVirtualMachine {
     pub fn add_to_scope(&self, name: String, value: JsValue) -> Result<(), JsValue> {
         self.with_vm(move |vm, StoredVirtualMachine { ref scope, .. }| {
             let value = convert::js_to_py(vm, value);
-            scope.globals.set_item(name, value, vm).into_js(vm)
+            scope.globals.set_item(&name, value, vm).into_js(vm)
         })?
     }
 
@@ -290,8 +299,8 @@ impl WASMVirtualMachine {
 
             let module = vm.new_module(&name, attrs, None);
 
-            let sys_modules = vm.sys_module.clone().get_attr("modules", vm).into_js(vm)?;
-            sys_modules.set_item(name, module, vm).into_js(vm)?;
+            let sys_modules = vm.sys_module.get_attr("modules", vm).into_js(vm)?;
+            sys_modules.set_item(&name, module, vm).into_js(vm)?;
 
             Ok(())
         })?
@@ -309,8 +318,8 @@ impl WASMVirtualMachine {
                 });
             }
 
-            let sys_modules = vm.sys_module.clone().get_attr("modules", vm).into_js(vm)?;
-            sys_modules.set_item(name, py_module, vm).into_js(vm)?;
+            let sys_modules = vm.sys_module.get_attr("modules", vm).into_js(vm)?;
+            sys_modules.set_item(&name, py_module, vm).into_js(vm)?;
 
             Ok(())
         })?
@@ -319,7 +328,7 @@ impl WASMVirtualMachine {
     pub(crate) fn run(
         &self,
         source: &str,
-        mode: compile::Mode,
+        mode: Mode,
         source_path: Option<String>,
     ) -> Result<JsValue, JsValue> {
         self.with_vm(|vm, StoredVirtualMachine { ref scope, .. }| {
@@ -332,11 +341,11 @@ impl WASMVirtualMachine {
     }
 
     pub fn exec(&self, source: &str, source_path: Option<String>) -> Result<JsValue, JsValue> {
-        self.run(source, compile::Mode::Exec, source_path)
+        self.run(source, Mode::Exec, source_path)
     }
 
     pub fn eval(&self, source: &str, source_path: Option<String>) -> Result<JsValue, JsValue> {
-        self.run(source, compile::Mode::Eval, source_path)
+        self.run(source, Mode::Eval, source_path)
     }
 
     #[wasm_bindgen(js_name = execSingle)]
@@ -345,6 +354,6 @@ impl WASMVirtualMachine {
         source: &str,
         source_path: Option<String>,
     ) -> Result<JsValue, JsValue> {
-        self.run(source, compile::Mode::Single, source_path)
+        self.run(source, Mode::Single, source_path)
     }
 }

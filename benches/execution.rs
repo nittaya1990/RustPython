@@ -4,8 +4,7 @@ use criterion::{
 };
 use rustpython_compiler::Mode;
 use rustpython_parser::parser::parse_program;
-use rustpython_vm::Interpreter;
-use rustpython_vm::PyResult;
+use rustpython_vm::{Interpreter, PyResult};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -24,7 +23,7 @@ fn bench_cpython_code(b: &mut Bencher, source: &str) {
 
 fn bench_rustpy_code(b: &mut Bencher, name: &str, source: &str) {
     // NOTE: Take long time.
-    Interpreter::default().enter(|vm| {
+    Interpreter::without_stdlib(Default::default()).enter(|vm| {
         // Note: bench_cpython is both compiling and executing the code.
         // As such we compile the code in the benchmark loop as well.
         b.iter(|| {
@@ -52,7 +51,7 @@ pub fn benchmark_file_execution(
 pub fn benchmark_file_parsing(group: &mut BenchmarkGroup<WallTime>, name: &str, contents: &str) {
     group.throughput(Throughput::Bytes(contents.len() as u64));
     group.bench_function(BenchmarkId::new("rustpython", name), |b| {
-        b.iter(|| parse_program(contents).unwrap())
+        b.iter(|| parse_program(contents, name).unwrap())
     });
     group.bench_function(BenchmarkId::new("cpython", name), |b| {
         let gil = cpython::Python::acquire_gil();

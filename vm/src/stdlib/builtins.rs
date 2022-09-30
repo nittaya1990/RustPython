@@ -1,41 +1,42 @@
 //! Builtin function definitions.
 //!
 //! Implements the list of [builtin Python functions](https://docs.python.org/3/library/builtins.html).
-use crate::{PyClassImpl, PyObjectRef, VirtualMachine};
+use crate::{class::PyClassImpl, PyObjectRef, VirtualMachine};
 
 /// Built-in functions, exceptions, and other objects.
 ///
 /// Noteworthy: None is the `nil' object; Ellipsis represents `...' in slices.
 #[pymodule]
 mod builtins {
-    #[cfg(feature = "rustpython-compiler")]
-    use crate::compile;
     use crate::{
         builtins::{
+            asyncgenerator::PyAsyncGen,
             enumerate::PyReverseSequenceIterator,
-            function::{PyCellRef, PyFunctionRef},
+            function::{PyCellRef, PyFunction},
             int::PyIntRef,
             iter::PyCallableIterator,
             list::{PyList, SortOptions},
-            PyByteArray, PyBytes, PyBytesRef, PyCode, PyDictRef, PyStr, PyStrRef, PyTuple,
-            PyTupleRef, PyType,
+            PyByteArray, PyBytes, PyDictRef, PyStr, PyStrRef, PyTuple, PyTupleRef, PyType,
         },
         common::{hash::PyHash, str::to_ascii},
+        convert::ToPyException,
+        format::call_object_format,
         function::{
-            ArgBytesLike, ArgCallable, ArgIntoBool, ArgIterable, FuncArgs, KwArgs, OptionalArg,
-            OptionalOption, PosArgs,
+            ArgBytesLike, ArgCallable, ArgIntoBool, ArgIterable, ArgMapping, ArgStrOrBytesLike,
+            Either, FuncArgs, KwArgs, OptionalArg, OptionalOption, PosArgs, PyArithmeticValue,
         },
-        protocol::{PyIter, PyIterReturn, PyMapping},
+        protocol::{PyIter, PyIterReturn},
         py_io,
         readline::{Readline, ReadlineResult},
-        scope::Scope,
         stdlib::sys,
         types::PyComparisonOp,
-        utils::Either,
-        IdProtocol, ItemProtocol, PyArithmeticValue, PyClassImpl, PyObject, PyObjectRef,
-        PyObjectWrap, PyRef, PyResult, PyValue, TryFromObject, TypeProtocol, VirtualMachine,
+        AsObject, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
     };
-    use num_traits::{Signed, ToPrimitive, Zero};
+    use num_traits::{Signed, ToPrimitive};
+
+    #[cfg(not(feature = "rustpython-compiler"))]
+    const CODEGEN_NOT_SUPPORTED: &str =
+        "can't compile() to bytecode when the `codegen` feature of rustpython is disabled";
 
     #[pyfunction]
     fn abs(x: PyObjectRef, vm: &VirtualMachine) -> PyResult {
@@ -45,7 +46,7 @@ mod builtins {
     #[pyfunction]
     fn all(iterable: ArgIterable<ArgIntoBool>, vm: &VirtualMachine) -> PyResult<bool> {
         for item in iterable.iter(vm)? {
-            if !item?.to_bool() {
+            if !*item? {
                 return Ok(false);
             }
         }
@@ -55,7 +56,7 @@ mod builtins {
     #[pyfunction]
     fn any(iterable: ArgIterable<ArgIntoBool>, vm: &VirtualMachine) -> PyResult<bool> {
         for item in iterable.iter(vm)? {
-            if item?.to_bool() {
+            if *item? {
                 return Ok(true);
             }
         }
@@ -78,8 +79,6 @@ mod builtins {
             format!("0b{:b}", x)
         }
     }
-
-    // builtin_breakpoint
 
     #[pyfunction]
     fn callable(obj: PyObjectRef, vm: &VirtualMachine) -> bool {
@@ -110,30 +109,35 @@ mod builtins {
         dont_inherit: OptionalArg<bool>,
         #[pyarg(any, optional)]
         optimize: OptionalArg<PyIntRef>,
+        #[pyarg(any, optional)]
+        _feature_version: OptionalArg<i32>,
     }
 
-    #[cfg(feature = "rustpython-compiler")]
+    #[cfg(any(feature = "rustpython-parser", feature = "rustpython-codegen"))]
     #[pyfunction]
     fn compile(args: CompileArgs, vm: &VirtualMachine) -> PyResult {
-        #[cfg(not(feature = "rustpython-ast"))]
-        {
-            Err(vm.new_value_error("can't use compile() when the `compiler` and `parser` features of rustpython are disabled".to_owned()))
-        }
         #[cfg(feature = "rustpython-ast")]
         {
-            use crate::stdlib::ast;
+            use crate::{class::PyClassImpl, stdlib::ast};
+
+            if args._feature_version.is_present() {
+                eprintln!("TODO: compile() got `_feature_version` but ignored");
+            }
 
             let mode_str = args.mode.as_str();
 
-            if args.source.isinstance(&ast::AstNode::make_class(&vm.ctx)) {
-                #[cfg(not(feature = "rustpython-compiler"))]
+            if args
+                .source
+                .fast_isinstance(&ast::AstNode::make_class(&vm.ctx))
+            {
+                #[cfg(not(feature = "rustpython-codegen"))]
                 {
-                    return Err(vm.new_value_error("can't compile ast nodes when the `compiler` feature of rustpython is disabled"));
+                    return Err(vm.new_type_error(CODEGEN_NOT_SUPPORTED.to_owned()));
                 }
-                #[cfg(feature = "rustpython-compiler")]
+                #[cfg(feature = "rustpython-codegen")]
                 {
                     let mode = mode_str
-                        .parse::<compile::Mode>()
+                        .parse::<crate::compiler::Mode>()
                         .map_err(|err| vm.new_value_error(err.to_string()))?;
                     return ast::compile(vm, args.source, args.filename.as_str(), mode);
                 }
@@ -141,16 +145,18 @@ mod builtins {
 
             #[cfg(not(feature = "rustpython-parser"))]
             {
-                Err(vm.new_value_error(
-                    "can't compile() a string when the `parser` feature of rustpython is disabled",
-                ))
+                const PARSER_NOT_SUPPORTED: &str =
+        "can't compile() source code when the `parser` feature of rustpython is disabled";
+                Err(vm.new_type_error(PARSER_NOT_SUPPORTED.to_owned()))
             }
             #[cfg(feature = "rustpython-parser")]
             {
+                use crate::builtins::PyBytesRef;
+                use num_traits::Zero;
                 use rustpython_parser::parser;
 
                 let source = Either::<PyStrRef, PyBytesRef>::try_from_object(vm, args.source)?;
-                // TODO: compile::compile should probably get bytes
+                // TODO: compiler::compile should probably get bytes
                 let source = match &source {
                     Either::A(string) => string.as_str(),
                     Either::B(bytes) => std::str::from_utf8(bytes)
@@ -162,23 +168,23 @@ mod builtins {
                 if (flags & ast::PY_COMPILE_FLAG_AST_ONLY).is_zero() {
                     #[cfg(not(feature = "rustpython-compiler"))]
                     {
-                        Err(vm.new_value_error("can't compile() a string to bytecode when the `compiler` feature of rustpython is disabled".to_owned()))
+                        Err(vm.new_value_error(CODEGEN_NOT_SUPPORTED.to_owned()))
                     }
                     #[cfg(feature = "rustpython-compiler")]
                     {
                         let mode = mode_str
-                            .parse::<compile::Mode>()
+                            .parse::<crate::compiler::Mode>()
                             .map_err(|err| vm.new_value_error(err.to_string()))?;
                         let code = vm
                             .compile(source, mode, args.filename.as_str().to_owned())
-                            .map_err(|err| vm.new_syntax_error(&err))?;
+                            .map_err(|err| err.to_pyexception(vm))?;
                         Ok(code.into())
                     }
                 } else {
                     let mode = mode_str
                         .parse::<parser::Mode>()
                         .map_err(|err| vm.new_value_error(err.to_string()))?;
-                    ast::parse(vm, source, mode)
+                    ast::parse(vm, source, mode).map_err(|e| e.to_pyexception(vm))
                 }
             }
         }
@@ -199,28 +205,27 @@ mod builtins {
         vm._divmod(&a, &b)
     }
 
-    #[cfg(feature = "rustpython-compiler")]
     #[derive(FromArgs)]
     struct ScopeArgs {
         #[pyarg(any, default)]
         globals: Option<PyDictRef>,
         #[pyarg(any, default)]
-        locals: Option<PyMapping>,
+        locals: Option<ArgMapping>,
     }
 
-    #[cfg(feature = "rustpython-compiler")]
     impl ScopeArgs {
-        fn make_scope(self, vm: &VirtualMachine) -> PyResult<Scope> {
+        fn make_scope(self, vm: &VirtualMachine) -> PyResult<crate::scope::Scope> {
             let (globals, locals) = match self.globals {
                 Some(globals) => {
-                    if !globals.contains_key("__builtins__", vm) {
-                        let builtins_dict = vm.builtins.dict().unwrap().into();
-                        globals.set_item("__builtins__", builtins_dict, vm)?;
+                    if !globals.contains_key(identifier!(vm, __builtins__), vm) {
+                        let builtins_dict = vm.builtins.dict().into();
+                        globals.set_item(identifier!(vm, __builtins__), builtins_dict, vm)?;
                     }
                     (
                         globals.clone(),
-                        self.locals
-                            .unwrap_or_else(|| PyMapping::new(globals.into())),
+                        self.locals.unwrap_or_else(|| {
+                            ArgMapping::try_from_object(vm, globals.into()).unwrap()
+                        }),
                     )
                 }
                 None => (
@@ -233,50 +238,73 @@ mod builtins {
                 ),
             };
 
-            let scope = Scope::with_builtins(Some(locals), globals, vm);
+            let scope = crate::scope::Scope::with_builtins(Some(locals), globals, vm);
             Ok(scope)
         }
     }
 
     /// Implements `eval`.
     /// See also: https://docs.python.org/3/library/functions.html#eval
-    #[cfg(feature = "rustpython-compiler")]
     #[pyfunction]
     fn eval(
-        source: Either<PyStrRef, PyRef<PyCode>>,
+        source: Either<ArgStrOrBytesLike, PyRef<crate::builtins::PyCode>>,
         scope: ScopeArgs,
         vm: &VirtualMachine,
     ) -> PyResult {
-        run_code(vm, source, scope, compile::Mode::Eval, "eval")
+        // source as string
+        let code = match source {
+            Either::A(either) => {
+                let source: &[u8] = &either.borrow_bytes();
+                if source.contains(&0) {
+                    return Err(vm.new_value_error(
+                        "source code string cannot contain null bytes".to_owned(),
+                    ));
+                }
+
+                let source = std::str::from_utf8(source).map_err(|err| {
+                    let msg = format!(
+                        "(unicode error) 'utf-8' codec can't decode byte 0x{:x?} in position {}: invalid start byte",
+                        source[err.valid_up_to()],
+                        err.valid_up_to()
+                    );
+
+                    vm.new_exception_msg(vm.ctx.exceptions.syntax_error.to_owned(), msg)
+                })?;
+                Ok(Either::A(vm.ctx.new_str(source)))
+            }
+            Either::B(code) => Ok(Either::B(code)),
+        }?;
+        run_code(vm, code, scope, crate::compiler::Mode::Eval, "eval")
     }
 
     /// Implements `exec`
     /// https://docs.python.org/3/library/functions.html#exec
-    #[cfg(feature = "rustpython-compiler")]
     #[pyfunction]
     fn exec(
-        source: Either<PyStrRef, PyRef<PyCode>>,
+        source: Either<PyStrRef, PyRef<crate::builtins::PyCode>>,
         scope: ScopeArgs,
         vm: &VirtualMachine,
     ) -> PyResult {
-        run_code(vm, source, scope, compile::Mode::Exec, "exec")
+        run_code(vm, source, scope, crate::compiler::Mode::Exec, "exec")
     }
 
-    #[cfg(feature = "rustpython-compiler")]
     fn run_code(
         vm: &VirtualMachine,
-        source: Either<PyStrRef, PyRef<PyCode>>,
+        source: Either<PyStrRef, PyRef<crate::builtins::PyCode>>,
         scope: ScopeArgs,
-        mode: compile::Mode,
+        #[allow(unused_variables)] mode: crate::compiler::Mode,
         func: &str,
     ) -> PyResult {
         let scope = scope.make_scope(vm)?;
 
         // Determine code object:
         let code_obj = match source {
+            #[cfg(feature = "rustpython-compiler")]
             Either::A(string) => vm
                 .compile(string.as_str(), mode, "<string>".to_owned())
                 .map_err(|err| vm.new_syntax_error(&err))?,
+            #[cfg(not(feature = "rustpython-compiler"))]
+            Either::A(_) => return Err(vm.new_type_error(CODEGEN_NOT_SUPPORTED.to_owned())),
             Either::B(code_obj) => code_obj,
         };
 
@@ -299,16 +327,9 @@ mod builtins {
     ) -> PyResult<PyStrRef> {
         let format_spec = format_spec
             .into_option()
-            .unwrap_or_else(|| PyStr::from("").into_ref(vm));
+            .unwrap_or_else(|| vm.ctx.empty_str.clone());
 
-        vm.call_method(&value, "__format__", (format_spec,))?
-            .downcast()
-            .map_err(|obj| {
-                vm.new_type_error(format!(
-                    "__format__ must return a str, not {}",
-                    obj.class().name()
-                ))
-            })
+        call_object_format(vm, value, None, format_spec.as_str())
     }
 
     #[pyfunction]
@@ -340,7 +361,16 @@ mod builtins {
         obj.hash(vm)
     }
 
-    // builtin_help
+    #[pyfunction]
+    fn breakpoint(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+        match vm
+            .sys_module
+            .get_attr(vm.ctx.intern_str("breakpointhook"), vm)
+        {
+            Ok(hook) => vm.invoke(hook.as_ref(), args),
+            Err(_) => Err(vm.new_runtime_error("lost sys.breakpointhook".to_owned())),
+        }
+    }
 
     #[pyfunction]
     fn hex(number: PyIntRef) -> String {
@@ -375,15 +405,12 @@ mod builtins {
             match readline.readline(prompt) {
                 ReadlineResult::Line(s) => Ok(vm.ctx.new_str(s).into()),
                 ReadlineResult::Eof => {
-                    Err(vm.new_exception_empty(vm.ctx.exceptions.eof_error.clone()))
+                    Err(vm.new_exception_empty(vm.ctx.exceptions.eof_error.to_owned()))
                 }
                 ReadlineResult::Interrupt => {
-                    Err(vm.new_exception_empty(vm.ctx.exceptions.keyboard_interrupt.clone()))
+                    Err(vm.new_exception_empty(vm.ctx.exceptions.keyboard_interrupt.to_owned()))
                 }
                 ReadlineResult::Io(e) => Err(vm.new_os_error(e.to_string())),
-                ReadlineResult::EncodingError => {
-                    Err(vm.new_unicode_decode_error("Error decoding readline input".to_owned()))
-                }
                 ReadlineResult::Other(e) => Err(vm.new_runtime_error(e.to_string())),
             }
         } else {
@@ -423,12 +450,21 @@ mod builtins {
     }
 
     #[pyfunction]
+    fn aiter(iter_target: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        if iter_target.payload_is::<PyAsyncGen>() {
+            vm.call_special_method(iter_target, identifier!(vm, __aiter__), ())
+        } else {
+            Err(vm.new_type_error("wrong argument type".to_owned()))
+        }
+    }
+
+    #[pyfunction]
     fn len(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
         obj.length(vm)
     }
 
     #[pyfunction]
-    fn locals(vm: &VirtualMachine) -> PyResult<PyMapping> {
+    fn locals(vm: &VirtualMachine) -> PyResult<ArgMapping> {
         vm.current_locals()
     }
 
@@ -455,7 +491,7 @@ mod builtins {
                 }
                 args.args
             }
-            std::cmp::Ordering::Equal => vm.extract_elements(&args.args[0])?,
+            std::cmp::Ordering::Equal => args.args[0].try_to_value(vm)?,
             std::cmp::Ordering::Less => {
                 // zero arguments means type error:
                 return Err(vm.new_type_error("Expected 1 or more arguments".to_owned()));
@@ -575,7 +611,6 @@ mod builtins {
         modulus: Option<PyObjectRef>,
     }
 
-    #[allow(clippy::suspicious_else_formatting)]
     #[pyfunction]
     fn pow(args: PowArgs, vm: &VirtualMachine) -> PyResult {
         let PowArgs {
@@ -584,25 +619,23 @@ mod builtins {
             modulus,
         } = args;
         match modulus {
-            None => vm.call_or_reflection(&x, &y, "__pow__", "__rpow__", |vm, x, y| {
-                Err(vm.new_unsupported_binop_error(x, y, "pow"))
-            }),
+            None => vm.call_or_reflection(
+                &x,
+                &y,
+                identifier!(vm, __pow__),
+                identifier!(vm, __rpow__),
+                |vm, x, y| Err(vm.new_unsupported_binop_error(x, y, "pow")),
+            ),
             Some(z) => {
                 let try_pow_value = |obj: &PyObject,
                                      args: (PyObjectRef, PyObjectRef, PyObjectRef)|
                  -> Option<PyResult> {
-                    if let Some(method) = obj.get_class_attr("__pow__") {
-                        let result = match vm.invoke(&method, args) {
-                            Ok(x) => x,
-                            Err(e) => return Some(Err(e)),
-                        };
-                        if let PyArithmeticValue::Implemented(x) =
-                            PyArithmeticValue::from_object(vm, result)
-                        {
-                            return Some(Ok(x));
-                        }
-                    }
-                    None
+                    let method = obj.get_class_attr(identifier!(vm, __pow__))?;
+                    let result = match vm.invoke(&method, args) {
+                        Ok(x) => x,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    Some(Ok(PyArithmeticValue::from_object(vm, result).into_option()?))
                 };
 
                 if let Some(val) = try_pow_value(&x, (x.clone(), y.clone(), z.clone())) {
@@ -629,7 +662,7 @@ mod builtins {
     #[pyfunction]
     pub fn exit(exit_code_arg: OptionalArg<PyObjectRef>, vm: &VirtualMachine) -> PyResult {
         let code = exit_code_arg.unwrap_or_else(|| vm.ctx.new_int(0).into());
-        Err(vm.new_exception(vm.ctx.exceptions.system_exit.clone(), vec![code]))
+        Err(vm.new_exception(vm.ctx.exceptions.system_exit.to_owned(), vec![code]))
     }
 
     #[derive(Debug, Default, FromArgs)]
@@ -670,7 +703,7 @@ mod builtins {
             .unwrap_or_else(|| PyStr::from("\n").into_ref(vm));
         write(end)?;
 
-        if options.flush.to_bool() {
+        if *options.flush {
             vm.call_method(&file, "flush", ())?;
         }
 
@@ -684,15 +717,15 @@ mod builtins {
 
     #[pyfunction]
     fn reversed(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        if let Some(reversed_method) = vm.get_method(obj.clone(), "__reversed__") {
+        if let Some(reversed_method) = vm.get_method(obj.clone(), identifier!(vm, __reversed__)) {
             vm.invoke(&reversed_method?, ())
         } else {
-            vm.get_method_or_type_error(obj.clone(), "__getitem__", || {
+            vm.get_method_or_type_error(obj.clone(), identifier!(vm, __getitem__), || {
                 "argument to reversed() must be a sequence".to_owned()
             })?;
             let len = obj.length(vm)?;
             let obj_iterator = PyReverseSequenceIterator::new(obj, len);
-            Ok(obj_iterator.into_object(vm))
+            Ok(obj_iterator.into_pyobject(vm))
         }
     }
 
@@ -706,7 +739,7 @@ mod builtins {
     #[pyfunction]
     fn round(RoundArgs { number, ndigits }: RoundArgs, vm: &VirtualMachine) -> PyResult {
         let meth = vm
-            .get_special_method(number, "__round__")?
+            .get_special_method(number, identifier!(vm, __round__))?
             .map_err(|number| {
                 vm.new_type_error(format!(
                     "type {} doesn't define __round__",
@@ -715,7 +748,7 @@ mod builtins {
             })?;
         match ndigits.flatten() {
             Some(obj) => {
-                let ndigits = vm.to_index(&obj)?;
+                let ndigits = obj.try_index(vm)?;
                 meth.invoke((ndigits,), vm)
             }
             None => {
@@ -740,7 +773,7 @@ mod builtins {
 
     #[pyfunction]
     fn sorted(iterable: PyObjectRef, opts: SortOptions, vm: &VirtualMachine) -> PyResult<PyList> {
-        let items = vm.extract_elements(&iterable)?;
+        let items: Vec<_> = iterable.try_to_value(vm)?;
         let lst = PyList::from(items);
         lst.sort(opts, vm)?;
         Ok(lst)
@@ -791,17 +824,18 @@ mod builtins {
     #[pyfunction]
     fn vars(obj: OptionalArg, vm: &VirtualMachine) -> PyResult {
         if let OptionalArg::Present(obj) = obj {
-            obj.get_attr("__dict__", vm).map_err(|_| {
-                vm.new_type_error("vars() argument must have __dict__ attribute".to_owned())
-            })
+            obj.get_attr(identifier!(vm, __dict__).to_owned(), vm)
+                .map_err(|_| {
+                    vm.new_type_error("vars() argument must have __dict__ attribute".to_owned())
+                })
         } else {
-            Ok(vm.current_locals()?.into_object())
+            Ok(vm.current_locals()?.into())
         }
     }
 
     #[pyfunction]
     pub fn __build_class__(
-        function: PyFunctionRef,
+        function: PyRef<PyFunction>,
         qualified_name: PyStrRef,
         bases: PosArgs,
         mut kwargs: KwArgs,
@@ -813,14 +847,15 @@ mod builtins {
         // Update bases.
         let mut new_bases: Option<Vec<PyObjectRef>> = None;
         let bases = PyTuple::new_ref(bases.into_vec(), &vm.ctx);
-        for (i, base) in bases.as_slice().iter().enumerate() {
-            if base.isinstance(&vm.ctx.types.type_type) {
+        for (i, base) in bases.iter().enumerate() {
+            if base.fast_isinstance(vm.ctx.types.type_type) {
                 if let Some(bases) = &mut new_bases {
                     bases.push(base.clone());
                 }
                 continue;
             }
-            let mro_entries = vm.get_attribute_opt(base.clone(), "__mro_entries__")?;
+            let mro_entries =
+                vm.get_attribute_opt(base.clone(), identifier!(vm, __mro_entries__))?;
             let entries = match mro_entries {
                 Some(meth) => vm.invoke(&meth, (bases.clone(),))?,
                 None => {
@@ -833,8 +868,8 @@ mod builtins {
             let entries: PyTupleRef = entries
                 .downcast()
                 .map_err(|_| vm.new_type_error("__mro_entries__ must return a tuple".to_owned()))?;
-            let new_bases = new_bases.get_or_insert_with(|| bases.as_slice()[..i].to_vec());
-            new_bases.extend_from_slice(entries.as_slice());
+            let new_bases = new_bases.get_or_insert_with(|| bases[..i].to_vec());
+            new_bases.extend_from_slice(&entries);
         }
 
         let new_bases = new_bases.map(|v| PyTuple::new_ref(v, &vm.ctx));
@@ -847,15 +882,15 @@ mod builtins {
         let metaclass = kwargs
             .pop_kwarg("metaclass")
             .map(|metaclass| metaclass.downcast_exact::<PyType>(vm))
-            .unwrap_or_else(|| Ok(vm.ctx.types.type_type.clone()));
+            .unwrap_or_else(|| Ok(vm.ctx.types.type_type.to_owned()));
 
         let (metaclass, meta_name) = match metaclass {
             Ok(mut metaclass) => {
-                for base in bases.as_slice().iter() {
+                for base in &bases {
                     let base_class = base.class();
-                    if base_class.issubclass(&metaclass) {
-                        metaclass = base.clone_class();
-                    } else if !metaclass.issubclass(&base_class) {
+                    if base_class.fast_issubclass(&metaclass) {
+                        metaclass = base.class().clone();
+                    } else if !metaclass.fast_issubclass(&base_class) {
                         return Err(vm.new_type_error(
                             "metaclass conflict: the metaclass of a derived class must be a (non-strict) \
                             subclass of the metaclasses of all its bases"
@@ -873,7 +908,7 @@ mod builtins {
 
         // Prepare uses full __getattribute__ resolution chain.
         let namespace = vm
-            .get_attribute_opt(metaclass.clone(), "__prepare__")?
+            .get_attribute_opt(metaclass.clone(), identifier!(vm, __prepare__))?
             .map_or(Ok(vm.ctx.new_dict().into()), |prepare| {
                 vm.invoke(
                     &prepare,
@@ -882,11 +917,11 @@ mod builtins {
             })?;
 
         // Accept any PyMapping as namespace.
-        let namespace = PyMapping::try_from_object(vm, namespace.clone()).map_err(|_| {
+        let namespace = ArgMapping::try_from_object(vm, namespace.clone()).map_err(|_| {
             vm.new_type_error(format!(
                 "{}.__prepare__() must return a mapping, not {}",
                 meta_name,
-                namespace.class().name()
+                namespace.class()
             ))
         })?;
 
@@ -894,9 +929,11 @@ mod builtins {
         let classcell = <Option<PyCellRef>>::try_from_object(vm, classcell)?;
 
         if let Some(orig_bases) = orig_bases {
-            namespace
-                .as_object()
-                .set_item("__orig_bases__", orig_bases.into(), vm)?;
+            namespace.as_object().set_item(
+                identifier!(vm, __orig_bases__),
+                orig_bases.into(),
+                vm,
+            )?;
         }
 
         let class = vm.invoke(
@@ -905,7 +942,19 @@ mod builtins {
         )?;
 
         if let Some(ref classcell) = classcell {
-            classcell.set(Some(class.clone()));
+            let classcell = classcell.get().ok_or_else(|| {
+                vm.new_type_error(format!(
+                    "__class__ not set defining {:?} as {:?}. Was __classcell__ propagated to type.__new__?",
+                    meta_name, class
+                ))
+            })?;
+
+            if !classcell.is(&class) {
+                return Err(vm.new_type_error(format!(
+                    "__class__ set to {:?} defining {:?} as {:?}",
+                    classcell, meta_name, class
+                )));
+            }
         }
 
         Ok(class)
@@ -919,117 +968,121 @@ pub fn make_module(vm: &VirtualMachine, module: PyObjectRef) {
 
     crate::protocol::VecBuffer::make_class(&vm.ctx);
 
-    let _ = builtins::extend_module(vm, &module);
+    builtins::extend_module(vm, &module);
 
     let debug_mode: bool = vm.state.settings.optimize == 0;
     extend_module!(vm, module, {
         "__debug__" => ctx.new_bool(debug_mode),
 
-        "bool" => ctx.types.bool_type.clone(),
-        "bytearray" => ctx.types.bytearray_type.clone(),
-        "bytes" => ctx.types.bytes_type.clone(),
-        "classmethod" => ctx.types.classmethod_type.clone(),
-        "complex" => ctx.types.complex_type.clone(),
-        "dict" => ctx.types.dict_type.clone(),
-        "enumerate" => ctx.types.enumerate_type.clone(),
-        "float" => ctx.types.float_type.clone(),
-        "frozenset" => ctx.types.frozenset_type.clone(),
-        "filter" => ctx.types.filter_type.clone(),
-        "int" => ctx.types.int_type.clone(),
-        "list" => ctx.types.list_type.clone(),
-        "map" => ctx.types.map_type.clone(),
-        "memoryview" => ctx.types.memoryview_type.clone(),
-        "object" => ctx.types.object_type.clone(),
-        "property" => ctx.types.property_type.clone(),
-        "range" => ctx.types.range_type.clone(),
-        "set" => ctx.types.set_type.clone(),
-        "slice" => ctx.types.slice_type.clone(),
-        "staticmethod" => ctx.types.staticmethod_type.clone(),
-        "str" => ctx.types.str_type.clone(),
-        "super" => ctx.types.super_type.clone(),
-        "tuple" => ctx.types.tuple_type.clone(),
-        "type" => ctx.types.type_type.clone(),
-        "zip" => ctx.types.zip_type.clone(),
+        "bool" => ctx.types.bool_type.to_owned(),
+        "bytearray" => ctx.types.bytearray_type.to_owned(),
+        "bytes" => ctx.types.bytes_type.to_owned(),
+        "classmethod" => ctx.types.classmethod_type.to_owned(),
+        "complex" => ctx.types.complex_type.to_owned(),
+        "dict" => ctx.types.dict_type.to_owned(),
+        "enumerate" => ctx.types.enumerate_type.to_owned(),
+        "float" => ctx.types.float_type.to_owned(),
+        "frozenset" => ctx.types.frozenset_type.to_owned(),
+        "filter" => ctx.types.filter_type.to_owned(),
+        "int" => ctx.types.int_type.to_owned(),
+        "list" => ctx.types.list_type.to_owned(),
+        "map" => ctx.types.map_type.to_owned(),
+        "memoryview" => ctx.types.memoryview_type.to_owned(),
+        "object" => ctx.types.object_type.to_owned(),
+        "property" => ctx.types.property_type.to_owned(),
+        "range" => ctx.types.range_type.to_owned(),
+        "set" => ctx.types.set_type.to_owned(),
+        "slice" => ctx.types.slice_type.to_owned(),
+        "staticmethod" => ctx.types.staticmethod_type.to_owned(),
+        "str" => ctx.types.str_type.to_owned(),
+        "super" => ctx.types.super_type.to_owned(),
+        "tuple" => ctx.types.tuple_type.to_owned(),
+        "type" => ctx.types.type_type.to_owned(),
+        "zip" => ctx.types.zip_type.to_owned(),
 
         // Constants
+        "None" => ctx.none(),
+        "True" => ctx.new_bool(true),
+        "False" => ctx.new_bool(false),
         "NotImplemented" => ctx.not_implemented(),
         "Ellipsis" => vm.ctx.ellipsis.clone(),
 
         // ordered by exception_hierarachy.txt
         // Exceptions:
-        "BaseException" => ctx.exceptions.base_exception_type.clone(),
-        "SystemExit" => ctx.exceptions.system_exit.clone(),
-        "KeyboardInterrupt" => ctx.exceptions.keyboard_interrupt.clone(),
-        "GeneratorExit" => ctx.exceptions.generator_exit.clone(),
-        "Exception" => ctx.exceptions.exception_type.clone(),
-        "StopIteration" => ctx.exceptions.stop_iteration.clone(),
-        "StopAsyncIteration" => ctx.exceptions.stop_async_iteration.clone(),
-        "ArithmeticError" => ctx.exceptions.arithmetic_error.clone(),
-        "FloatingPointError" => ctx.exceptions.floating_point_error.clone(),
-        "OverflowError" => ctx.exceptions.overflow_error.clone(),
-        "ZeroDivisionError" => ctx.exceptions.zero_division_error.clone(),
-        "AssertionError" => ctx.exceptions.assertion_error.clone(),
-        "AttributeError" => ctx.exceptions.attribute_error.clone(),
-        "BufferError" => ctx.exceptions.buffer_error.clone(),
-        "EOFError" => ctx.exceptions.eof_error.clone(),
-        "ImportError" => ctx.exceptions.import_error.clone(),
-        "ModuleNotFoundError" => ctx.exceptions.module_not_found_error.clone(),
-        "LookupError" => ctx.exceptions.lookup_error.clone(),
-        "IndexError" => ctx.exceptions.index_error.clone(),
-        "KeyError" => ctx.exceptions.key_error.clone(),
-        "MemoryError" => ctx.exceptions.memory_error.clone(),
-        "NameError" => ctx.exceptions.name_error.clone(),
-        "UnboundLocalError" => ctx.exceptions.unbound_local_error.clone(),
-        "OSError" => ctx.exceptions.os_error.clone(),
+        "BaseException" => ctx.exceptions.base_exception_type.to_owned(),
+        "SystemExit" => ctx.exceptions.system_exit.to_owned(),
+        "KeyboardInterrupt" => ctx.exceptions.keyboard_interrupt.to_owned(),
+        "GeneratorExit" => ctx.exceptions.generator_exit.to_owned(),
+        "Exception" => ctx.exceptions.exception_type.to_owned(),
+        "StopIteration" => ctx.exceptions.stop_iteration.to_owned(),
+        "StopAsyncIteration" => ctx.exceptions.stop_async_iteration.to_owned(),
+        "ArithmeticError" => ctx.exceptions.arithmetic_error.to_owned(),
+        "FloatingPointError" => ctx.exceptions.floating_point_error.to_owned(),
+        "OverflowError" => ctx.exceptions.overflow_error.to_owned(),
+        "ZeroDivisionError" => ctx.exceptions.zero_division_error.to_owned(),
+        "AssertionError" => ctx.exceptions.assertion_error.to_owned(),
+        "AttributeError" => ctx.exceptions.attribute_error.to_owned(),
+        "BufferError" => ctx.exceptions.buffer_error.to_owned(),
+        "EOFError" => ctx.exceptions.eof_error.to_owned(),
+        "ImportError" => ctx.exceptions.import_error.to_owned(),
+        "ModuleNotFoundError" => ctx.exceptions.module_not_found_error.to_owned(),
+        "LookupError" => ctx.exceptions.lookup_error.to_owned(),
+        "IndexError" => ctx.exceptions.index_error.to_owned(),
+        "KeyError" => ctx.exceptions.key_error.to_owned(),
+        "MemoryError" => ctx.exceptions.memory_error.to_owned(),
+        "NameError" => ctx.exceptions.name_error.to_owned(),
+        "UnboundLocalError" => ctx.exceptions.unbound_local_error.to_owned(),
+        "OSError" => ctx.exceptions.os_error.to_owned(),
         // OSError alias
-        "IOError" => ctx.exceptions.os_error.clone(),
-        "EnvironmentError" => ctx.exceptions.os_error.clone(),
-        "BlockingIOError" => ctx.exceptions.blocking_io_error.clone(),
-        "ChildProcessError" => ctx.exceptions.child_process_error.clone(),
-        "ConnectionError" => ctx.exceptions.connection_error.clone(),
-        "BrokenPipeError" => ctx.exceptions.broken_pipe_error.clone(),
-        "ConnectionAbortedError" => ctx.exceptions.connection_aborted_error.clone(),
-        "ConnectionRefusedError" => ctx.exceptions.connection_refused_error.clone(),
-        "ConnectionResetError" => ctx.exceptions.connection_reset_error.clone(),
-        "FileExistsError" => ctx.exceptions.file_exists_error.clone(),
-        "FileNotFoundError" => ctx.exceptions.file_not_found_error.clone(),
-        "InterruptedError" => ctx.exceptions.interrupted_error.clone(),
-        "IsADirectoryError" => ctx.exceptions.is_a_directory_error.clone(),
-        "NotADirectoryError" => ctx.exceptions.not_a_directory_error.clone(),
-        "PermissionError" => ctx.exceptions.permission_error.clone(),
-        "ProcessLookupError" => ctx.exceptions.process_lookup_error.clone(),
-        "TimeoutError" => ctx.exceptions.timeout_error.clone(),
-        "ReferenceError" => ctx.exceptions.reference_error.clone(),
-        "RuntimeError" => ctx.exceptions.runtime_error.clone(),
-        "NotImplementedError" => ctx.exceptions.not_implemented_error.clone(),
-        "RecursionError" => ctx.exceptions.recursion_error.clone(),
-        "SyntaxError" =>  ctx.exceptions.syntax_error.clone(),
-        "IndentationError" =>  ctx.exceptions.indentation_error.clone(),
-        "TabError" =>  ctx.exceptions.tab_error.clone(),
-        "SystemError" => ctx.exceptions.system_error.clone(),
-        "TypeError" => ctx.exceptions.type_error.clone(),
-        "ValueError" => ctx.exceptions.value_error.clone(),
-        "UnicodeError" => ctx.exceptions.unicode_error.clone(),
-        "UnicodeDecodeError" => ctx.exceptions.unicode_decode_error.clone(),
-        "UnicodeEncodeError" => ctx.exceptions.unicode_encode_error.clone(),
-        "UnicodeTranslateError" => ctx.exceptions.unicode_translate_error.clone(),
+        "IOError" => ctx.exceptions.os_error.to_owned(),
+        "EnvironmentError" => ctx.exceptions.os_error.to_owned(),
+        "BlockingIOError" => ctx.exceptions.blocking_io_error.to_owned(),
+        "ChildProcessError" => ctx.exceptions.child_process_error.to_owned(),
+        "ConnectionError" => ctx.exceptions.connection_error.to_owned(),
+        "BrokenPipeError" => ctx.exceptions.broken_pipe_error.to_owned(),
+        "ConnectionAbortedError" => ctx.exceptions.connection_aborted_error.to_owned(),
+        "ConnectionRefusedError" => ctx.exceptions.connection_refused_error.to_owned(),
+        "ConnectionResetError" => ctx.exceptions.connection_reset_error.to_owned(),
+        "FileExistsError" => ctx.exceptions.file_exists_error.to_owned(),
+        "FileNotFoundError" => ctx.exceptions.file_not_found_error.to_owned(),
+        "InterruptedError" => ctx.exceptions.interrupted_error.to_owned(),
+        "IsADirectoryError" => ctx.exceptions.is_a_directory_error.to_owned(),
+        "NotADirectoryError" => ctx.exceptions.not_a_directory_error.to_owned(),
+        "PermissionError" => ctx.exceptions.permission_error.to_owned(),
+        "ProcessLookupError" => ctx.exceptions.process_lookup_error.to_owned(),
+        "TimeoutError" => ctx.exceptions.timeout_error.to_owned(),
+        "ReferenceError" => ctx.exceptions.reference_error.to_owned(),
+        "RuntimeError" => ctx.exceptions.runtime_error.to_owned(),
+        "NotImplementedError" => ctx.exceptions.not_implemented_error.to_owned(),
+        "RecursionError" => ctx.exceptions.recursion_error.to_owned(),
+        "SyntaxError" =>  ctx.exceptions.syntax_error.to_owned(),
+        "IndentationError" =>  ctx.exceptions.indentation_error.to_owned(),
+        "TabError" =>  ctx.exceptions.tab_error.to_owned(),
+        "SystemError" => ctx.exceptions.system_error.to_owned(),
+        "TypeError" => ctx.exceptions.type_error.to_owned(),
+        "ValueError" => ctx.exceptions.value_error.to_owned(),
+        "UnicodeError" => ctx.exceptions.unicode_error.to_owned(),
+        "UnicodeDecodeError" => ctx.exceptions.unicode_decode_error.to_owned(),
+        "UnicodeEncodeError" => ctx.exceptions.unicode_encode_error.to_owned(),
+        "UnicodeTranslateError" => ctx.exceptions.unicode_translate_error.to_owned(),
 
         // Warnings
-        "Warning" => ctx.exceptions.warning.clone(),
-        "DeprecationWarning" => ctx.exceptions.deprecation_warning.clone(),
-        "PendingDeprecationWarning" => ctx.exceptions.pending_deprecation_warning.clone(),
-        "RuntimeWarning" => ctx.exceptions.runtime_warning.clone(),
-        "SyntaxWarning" => ctx.exceptions.syntax_warning.clone(),
-        "UserWarning" => ctx.exceptions.user_warning.clone(),
-        "FutureWarning" => ctx.exceptions.future_warning.clone(),
-        "ImportWarning" => ctx.exceptions.import_warning.clone(),
-        "UnicodeWarning" => ctx.exceptions.unicode_warning.clone(),
-        "BytesWarning" => ctx.exceptions.bytes_warning.clone(),
-        "ResourceWarning" => ctx.exceptions.resource_warning.clone(),
+        "Warning" => ctx.exceptions.warning.to_owned(),
+        "DeprecationWarning" => ctx.exceptions.deprecation_warning.to_owned(),
+        "PendingDeprecationWarning" => ctx.exceptions.pending_deprecation_warning.to_owned(),
+        "RuntimeWarning" => ctx.exceptions.runtime_warning.to_owned(),
+        "SyntaxWarning" => ctx.exceptions.syntax_warning.to_owned(),
+        "UserWarning" => ctx.exceptions.user_warning.to_owned(),
+        "FutureWarning" => ctx.exceptions.future_warning.to_owned(),
+        "ImportWarning" => ctx.exceptions.import_warning.to_owned(),
+        "UnicodeWarning" => ctx.exceptions.unicode_warning.to_owned(),
+        "BytesWarning" => ctx.exceptions.bytes_warning.to_owned(),
+        "ResourceWarning" => ctx.exceptions.resource_warning.to_owned(),
+        "EncodingWarning" => ctx.exceptions.encoding_warning.to_owned(),
     });
 
     #[cfg(feature = "jit")]
     extend_module!(vm, module, {
-        "JitError" => ctx.exceptions.jit_error.clone(),
+        "JitError" => ctx.exceptions.jit_error.to_owned(),
     });
 }

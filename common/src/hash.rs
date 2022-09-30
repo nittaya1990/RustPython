@@ -1,9 +1,7 @@
 use num_bigint::BigInt;
-use num_complex::Complex64;
 use num_traits::ToPrimitive;
 use siphasher::sip::SipHasher24;
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::num::Wrapping;
 
 pub type PyHash = i64;
 pub type PyUHash = u64;
@@ -52,8 +50,9 @@ impl HashSecret {
     pub fn new(seed: u32) -> Self {
         let mut buf = [0u8; 16];
         lcg_urandom(seed, &mut buf);
-        let k0 = u64::from_le_bytes(buf[..8].try_into().unwrap());
-        let k1 = u64::from_le_bytes(buf[8..].try_into().unwrap());
+        let (left, right) = buf.split_at(8);
+        let k0 = u64::from_le_bytes(left.try_into().unwrap());
+        let k1 = u64::from_le_bytes(right.try_into().unwrap());
         Self { k0, k1 }
     }
 }
@@ -91,17 +90,14 @@ impl HashSecret {
     }
 }
 
-pub fn hash_float(value: f64) -> PyHash {
+#[inline]
+pub fn hash_float(value: f64) -> Option<PyHash> {
     // cpython _Py_HashDouble
     if !value.is_finite() {
         return if value.is_infinite() {
-            if value > 0.0 {
-                INF
-            } else {
-                -INF
-            }
+            Some(if value > 0.0 { INF } else { -INF })
         } else {
-            NAN
+            None
         };
     }
 
@@ -133,14 +129,7 @@ pub fn hash_float(value: f64) -> PyHash {
     };
     x = ((x << e) & MODULUS) | x >> (BITS32 - e);
 
-    fix_sentinel(x as PyHash * value.signum() as PyHash)
-}
-
-pub fn hash_complex(value: &Complex64) -> PyHash {
-    let re_hash = hash_float(value.re);
-    let im_hash = hash_float(value.im);
-    let Wrapping(ret) = Wrapping(re_hash) + Wrapping(im_hash) * Wrapping(IMAG);
-    fix_sentinel(ret)
+    Some(fix_sentinel(x as PyHash * value.signum() as PyHash))
 }
 
 pub fn hash_iter_unordered<'a, T: 'a, I, F, E>(iter: I, hashf: F) -> Result<PyHash, E>
@@ -169,7 +158,7 @@ pub fn hash_bigint(value: &BigInt) -> PyHash {
 }
 
 #[inline(always)]
-fn fix_sentinel(x: PyHash) -> PyHash {
+pub fn fix_sentinel(x: PyHash) -> PyHash {
     if x == SENTINEL {
         -2
     } else {
@@ -184,8 +173,30 @@ pub fn mod_int(value: i64) -> PyHash {
 
 pub fn lcg_urandom(mut x: u32, buf: &mut [u8]) {
     for b in buf {
-        x *= 214013;
-        x += 2531011;
+        x = x.wrapping_mul(214013);
+        x = x.wrapping_add(2531011);
         *b = ((x >> 16) & 0xff) as u8;
     }
+}
+
+#[inline]
+pub fn hash_object_id_raw(p: usize) -> PyHash {
+    // TODO: Use commented logic when below issue resolved.
+    // Ref: https://github.com/RustPython/RustPython/pull/3951#issuecomment-1193108966
+
+    /* bottom 3 or 4 bits are likely to be 0; rotate y by 4 to avoid
+    excessive hash collisions for dicts and sets */
+    // p.rotate_right(4) as PyHash
+    p as PyHash
+}
+
+#[inline]
+pub fn hash_object_id(p: usize) -> PyHash {
+    fix_sentinel(hash_object_id_raw(p))
+}
+
+pub fn keyed_hash(key: u64, buf: &[u8]) -> u64 {
+    let mut hasher = SipHasher24::new_with_keys(key, 0);
+    buf.hash(&mut hasher);
+    hasher.finish()
 }

@@ -1,11 +1,13 @@
 /*! Python `property` descriptor class.
 
 */
-use super::PyTypeRef;
+use super::{PyType, PyTypeRef};
 use crate::common::lock::PyRwLock;
 use crate::{
-    function::FuncArgs, types::GetDescriptor, PyClassImpl, PyContext, PyObjectRef, PyRef, PyResult,
-    PyValue, TryFromObject, TypeProtocol, VirtualMachine,
+    class::PyClassImpl,
+    function::{FuncArgs, PySetterValue},
+    types::{Constructor, GetDescriptor, Initializer},
+    AsObject, Context, Py, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
 };
 
 /// Property attribute.
@@ -49,14 +51,14 @@ pub struct PyProperty {
     doc: PyRwLock<Option<PyObjectRef>>,
 }
 
-impl PyValue for PyProperty {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.property_type
+impl PyPayload for PyProperty {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.property_type
     }
 }
 
 #[derive(FromArgs)]
-struct PropertyArgs {
+pub struct PropertyArgs {
     #[pyarg(any, default)]
     fget: Option<PyObjectRef>,
     #[pyarg(any, default)]
@@ -85,46 +87,27 @@ impl GetDescriptor for PyProperty {
     }
 }
 
-#[pyimpl(with(GetDescriptor), flags(BASETYPE))]
+#[pyclass(with(Constructor, Initializer, GetDescriptor), flags(BASETYPE))]
 impl PyProperty {
-    #[pyslot]
-    fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-        PyProperty {
-            getter: PyRwLock::new(None),
-            setter: PyRwLock::new(None),
-            deleter: PyRwLock::new(None),
-            doc: PyRwLock::new(None),
-        }
-        .into_pyresult_with_type(vm, cls)
-    }
-
-    #[pymethod(magic)]
-    fn init(&self, args: PropertyArgs) {
-        *self.getter.write() = args.fget;
-        *self.setter.write() = args.fset;
-        *self.deleter.write() = args.fdel;
-        *self.doc.write() = args.doc;
-    }
-
     // Descriptor methods
 
     #[pyslot]
     fn descr_set(
         zelf: PyObjectRef,
         obj: PyObjectRef,
-        value: Option<PyObjectRef>,
+        value: PySetterValue,
         vm: &VirtualMachine,
     ) -> PyResult<()> {
         let zelf = PyRef::<Self>::try_from_object(vm, zelf)?;
         match value {
-            Some(value) => {
+            PySetterValue::Assign(value) => {
                 if let Some(setter) = zelf.setter.read().as_ref() {
                     vm.invoke(setter, (obj, value)).map(drop)
                 } else {
                     Err(vm.new_attribute_error("can't set attribute".to_owned()))
                 }
             }
-            None => {
+            PySetterValue::Delete => {
                 if let Some(deleter) = zelf.deleter.read().as_ref() {
                     vm.invoke(deleter, (obj,)).map(drop)
                 } else {
@@ -140,26 +123,26 @@ impl PyProperty {
         value: PyObjectRef,
         vm: &VirtualMachine,
     ) -> PyResult<()> {
-        Self::descr_set(zelf, obj, Some(value), vm)
+        Self::descr_set(zelf, obj, PySetterValue::Assign(value), vm)
     }
     #[pymethod]
     fn __delete__(zelf: PyObjectRef, obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
-        Self::descr_set(zelf, obj, None, vm)
+        Self::descr_set(zelf, obj, PySetterValue::Delete, vm)
     }
 
     // Access functions
 
-    #[pyproperty]
+    #[pygetset]
     fn fget(&self) -> Option<PyObjectRef> {
         self.getter.read().clone()
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn fset(&self) -> Option<PyObjectRef> {
         self.setter.read().clone()
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn fdel(&self) -> Option<PyObjectRef> {
         self.deleter.read().clone()
     }
@@ -185,7 +168,7 @@ impl PyProperty {
             deleter: PyRwLock::new(zelf.fdel()),
             doc: PyRwLock::new(None),
         }
-        .into_ref_with_type(vm, TypeProtocol::clone_class(&zelf))
+        .into_ref_with_type(vm, zelf.class().clone())
     }
 
     #[pymethod]
@@ -200,7 +183,7 @@ impl PyProperty {
             deleter: PyRwLock::new(zelf.fdel()),
             doc: PyRwLock::new(None),
         }
-        .into_ref_with_type(vm, TypeProtocol::clone_class(&zelf))
+        .into_ref_with_type(vm, zelf.class().clone())
     }
 
     #[pymethod]
@@ -215,19 +198,72 @@ impl PyProperty {
             deleter: PyRwLock::new(deleter.or_else(|| zelf.fdel())),
             doc: PyRwLock::new(None),
         }
-        .into_ref_with_type(vm, TypeProtocol::clone_class(&zelf))
+        .into_ref_with_type(vm, zelf.class().clone())
+    }
+
+    #[pygetset(magic)]
+    fn isabstractmethod(&self, vm: &VirtualMachine) -> PyObjectRef {
+        let getter_abstract = match self.getter.read().to_owned() {
+            Some(getter) => getter
+                .get_attr("__isabstractmethod__", vm)
+                .unwrap_or_else(|_| vm.ctx.new_bool(false).into()),
+            _ => vm.ctx.new_bool(false).into(),
+        };
+        let setter_abstract = match self.setter.read().to_owned() {
+            Some(setter) => setter
+                .get_attr("__isabstractmethod__", vm)
+                .unwrap_or_else(|_| vm.ctx.new_bool(false).into()),
+            _ => vm.ctx.new_bool(false).into(),
+        };
+        vm._or(&setter_abstract, &getter_abstract)
+            .unwrap_or_else(|_| vm.ctx.new_bool(false).into())
+    }
+
+    #[pygetset(magic, setter)]
+    fn set_isabstractmethod(&self, value: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        if let Some(getter) = self.getter.read().to_owned() {
+            getter.set_attr("__isabstractmethod__", value, vm)?;
+        }
+        Ok(())
     }
 }
 
-pub(crate) fn init(context: &PyContext) {
-    PyProperty::extend_class(context, &context.types.property_type);
+impl Constructor for PyProperty {
+    type Args = FuncArgs;
+
+    fn py_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+        PyProperty {
+            getter: PyRwLock::new(None),
+            setter: PyRwLock::new(None),
+            deleter: PyRwLock::new(None),
+            doc: PyRwLock::new(None),
+        }
+        .into_ref_with_type(vm, cls)
+        .map(Into::into)
+    }
+}
+
+impl Initializer for PyProperty {
+    type Args = PropertyArgs;
+
+    fn init(zelf: PyRef<Self>, args: Self::Args, _vm: &VirtualMachine) -> PyResult<()> {
+        *zelf.getter.write() = args.fget;
+        *zelf.setter.write() = args.fset;
+        *zelf.deleter.write() = args.fdel;
+        *zelf.doc.write() = args.doc;
+        Ok(())
+    }
+}
+
+pub(crate) fn init(context: &Context) {
+    PyProperty::extend_class(context, context.types.property_type);
 
     // This is a bit unfortunate, but this instance attribute overlaps with the
     // class __doc__ string..
-    extend_class!(context, &context.types.property_type, {
+    extend_class!(context, context.types.property_type, {
         "__doc__" => context.new_getset(
             "__doc__",
-            context.types.property_type.clone(),
+            context.types.property_type,
             PyProperty::doc_getter,
             PyProperty::doc_setter,
         ),

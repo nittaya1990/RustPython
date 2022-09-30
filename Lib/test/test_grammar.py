@@ -1,7 +1,8 @@
 # Python test set -- part 1, grammar.
 # This just tests whether the parser accepts them all.
 
-from test.support import check_syntax_error, check_syntax_warning
+from test.support import check_syntax_error
+from test.support.warnings_helper import check_syntax_warning
 import inspect
 import unittest
 import sys
@@ -256,8 +257,6 @@ the \'lazy\' dog.\n\
         self.assertTrue(x is Ellipsis)
         self.assertRaises(SyntaxError, eval, ".. .")
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_eof_error(self):
         samples = ("def foo(", "\ndef foo(", "def foo(\n")
         for s in samples:
@@ -280,7 +279,8 @@ class CNS:
 
 class GrammarTests(unittest.TestCase):
 
-    from test.support import check_syntax_error, check_syntax_warning
+    from test.support import check_syntax_error
+    from test.support.warnings_helper import check_syntax_warning
 
     # single_input: NEWLINE | simple_stmt | compound_stmt NEWLINE
     # XXX can't test in a script -- this rule is only used when interactive

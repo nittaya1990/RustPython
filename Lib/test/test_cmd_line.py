@@ -57,7 +57,7 @@ class CmdLineTest(unittest.TestCase):
         # but the rest should be ASCII-only
         b''.join(lines[1:]).decode('ascii')
 
-    # TODO: RUSTPYTHON
+    # NOTE: RUSTPYTHON version never starts with Python
     @unittest.expectedFailure
     def test_version(self):
         version = ('Python %d.%d' % sys.version_info[:2]).encode("ascii")
@@ -75,8 +75,6 @@ class CmdLineTest(unittest.TestCase):
         rc, out, err = assert_python_ok('-vv')
         self.assertNotIn(b'stack overflow', err)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     @unittest.skipIf(interpreter_requires_environment(),
                      'Cannot run -E tests when PYTHON env vars are required.')
     def test_xoptions(self):
@@ -718,7 +716,7 @@ class CmdLineTest(unittest.TestCase):
 
     def check_warnings_filters(self, cmdline_option, envvar, use_pywarning=False):
         if use_pywarning:
-            code = ("import sys; from test.support import import_fresh_module; "
+            code = ("import sys; from test.support.import_helper import import_fresh_module; "
                     "warnings = import_fresh_module('warnings', blocked=['_warnings']); ")
         else:
             code = "import sys, warnings; "

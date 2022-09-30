@@ -1,37 +1,33 @@
-use super::{PositionIterInternal, PyDictRef, PyIntRef, PyStrRef, PyTuple, PyTupleRef, PyTypeRef};
+use super::{
+    PositionIterInternal, PyDictRef, PyIntRef, PyStrRef, PyTuple, PyTupleRef, PyType, PyTypeRef,
+};
 use crate::{
     anystr::{self, AnyStr},
-    builtins::PyType,
+    atomic_func,
     bytesinner::{
         bytes_decode, ByteInnerFindOptions, ByteInnerNewOptions, ByteInnerPaddingOptions,
         ByteInnerSplitOptions, ByteInnerTranslateOptions, DecodeArgs, PyBytesInner,
     },
+    class::PyClassImpl,
     common::{hash::PyHash, lock::PyMutex},
-    function::{
-        ArgBytesLike, ArgIterable, IntoPyObject, IntoPyResult, OptionalArg, OptionalOption,
+    convert::{ToPyObject, ToPyResult},
+    function::Either,
+    function::{ArgBytesLike, ArgIterable, OptionalArg, OptionalOption, PyComparisonValue},
+    protocol::{
+        BufferDescriptor, BufferMethods, PyBuffer, PyIterReturn, PyMappingMethods, PyNumberMethods,
+        PySequenceMethods,
     },
-    protocol::{BufferDescriptor, BufferMethods, PyBuffer, PyIterReturn, PyMappingMethods},
+    sliceable::{SequenceIndex, SliceableSequenceOp},
     types::{
-        AsBuffer, AsMapping, Callable, Comparable, Constructor, Hashable, IterNext,
-        IterNextIterable, Iterable, PyComparisonOp, Unconstructible,
+        AsBuffer, AsMapping, AsNumber, AsSequence, Callable, Comparable, Constructor, Hashable,
+        IterNext, IterNextIterable, Iterable, PyComparisonOp, Unconstructible,
     },
-    utils::Either,
-    IdProtocol, PyClassImpl, PyComparisonValue, PyContext, PyObject, PyObjectRef, PyObjectView,
-    PyObjectWrap, PyRef, PyResult, PyValue, TryFromBorrowedObject, TypeProtocol, VirtualMachine,
+    AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
+    TryFromBorrowedObject, TryFromObject, VirtualMachine,
 };
 use bstr::ByteSlice;
-use std::mem::size_of;
-use std::ops::Deref;
+use std::{mem::size_of, ops::Deref};
 
-/// "bytes(iterable_of_ints) -> bytes\n\
-/// bytes(string, encoding[, errors]) -> bytes\n\
-/// bytes(bytes_or_buffer) -> immutable copy of bytes_or_buffer\n\
-/// bytes(int) -> bytes object of size given by the parameter initialized with null bytes\n\
-/// bytes() -> empty bytes object\n\nConstruct an immutable array of bytes from:\n  \
-/// - an iterable yielding integers in range(256)\n  \
-/// - a text string encoded using the specified encoding\n  \
-/// - any object implementing the buffer API.\n  \
-/// - an integer";
 #[pyclass(module = false, name = "bytes")]
 #[derive(Clone, Debug)]
 pub struct PyBytes {
@@ -54,8 +50,8 @@ impl From<PyBytesInner> for PyBytes {
     }
 }
 
-impl IntoPyObject for Vec<u8> {
-    fn into_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
+impl ToPyObject for Vec<u8> {
+    fn to_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
         vm.ctx.new_bytes(self).into()
     }
 }
@@ -79,34 +75,43 @@ impl AsRef<[u8]> for PyBytesRef {
     }
 }
 
-impl PyValue for PyBytes {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.bytes_type
+impl PyPayload for PyBytes {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.bytes_type
     }
 }
 
-pub(crate) fn init(context: &PyContext) {
-    PyBytes::extend_class(context, &context.types.bytes_type);
-    PyBytesIterator::extend_class(context, &context.types.bytes_iterator_type);
+pub(crate) fn init(context: &Context) {
+    PyBytes::extend_class(context, context.types.bytes_type);
+    PyBytesIterator::extend_class(context, context.types.bytes_iterator_type);
 }
 
 impl Constructor for PyBytes {
     type Args = ByteInnerNewOptions;
 
     fn py_new(cls: PyTypeRef, options: Self::Args, vm: &VirtualMachine) -> PyResult {
-        options.get_bytes(cls, vm).into_pyresult(vm)
+        options.get_bytes(cls, vm).to_pyresult(vm)
     }
 }
 
 impl PyBytes {
-    pub fn new_ref(data: Vec<u8>, ctx: &PyContext) -> PyRef<Self> {
-        PyRef::new_ref(Self::from(data), ctx.types.bytes_type.clone(), None)
+    pub fn new_ref(data: Vec<u8>, ctx: &Context) -> PyRef<Self> {
+        PyRef::new_ref(Self::from(data), ctx.types.bytes_type.to_owned(), None)
     }
 }
 
-#[pyimpl(
+#[pyclass(
     flags(BASETYPE),
-    with(AsMapping, Hashable, Comparable, AsBuffer, Iterable, Constructor)
+    with(
+        AsMapping,
+        AsSequence,
+        Hashable,
+        Comparable,
+        AsBuffer,
+        Iterable,
+        Constructor,
+        AsNumber
+    )
 )]
 impl PyBytes {
     #[pymethod(magic)]
@@ -132,7 +137,7 @@ impl PyBytes {
 
     #[pymethod(magic)]
     fn bytes(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyRef<Self> {
-        if zelf.is(&vm.ctx.types.bytes_type) {
+        if zelf.is(vm.ctx.types.bytes_type) {
             zelf
         } else {
             PyBytes::from(zelf.inner.clone()).into_ref(vm)
@@ -146,7 +151,7 @@ impl PyBytes {
 
     #[pymethod(magic)]
     fn add(&self, other: ArgBytesLike) -> Vec<u8> {
-        self.inner.add(&*other.borrow_buf())
+        self.inner.add(&other.borrow_buf())
     }
 
     #[pymethod(magic)]
@@ -158,14 +163,29 @@ impl PyBytes {
         self.inner.contains(needle, vm)
     }
 
-    #[pymethod]
-    fn maketrans(from: PyBytesInner, to: PyBytesInner) -> PyResult<Vec<u8>> {
-        PyBytesInner::maketrans(from, to)
+    #[pystaticmethod]
+    fn maketrans(from: PyBytesInner, to: PyBytesInner, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
+        PyBytesInner::maketrans(from, to, vm)
+    }
+
+    fn _getitem(&self, needle: &PyObject, vm: &VirtualMachine) -> PyResult {
+        match SequenceIndex::try_from_borrowed_object(vm, needle, "byte")? {
+            SequenceIndex::Int(i) => self
+                .inner
+                .elements
+                .getitem_by_index(vm, i)
+                .map(|x| vm.ctx.new_int(x).into()),
+            SequenceIndex::Slice(slice) => self
+                .inner
+                .elements
+                .getitem_by_slice(vm, slice)
+                .map(|x| vm.ctx.new_bytes(x).into()),
+        }
     }
 
     #[pymethod(magic)]
     fn getitem(&self, needle: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        self.inner.getitem("byte", needle, vm) // byte != Self::NAME
+        self._getitem(&needle, vm)
     }
 
     #[pymethod]
@@ -463,21 +483,16 @@ impl PyBytes {
     #[pymethod(name = "__rmul__")]
     #[pymethod(magic)]
     fn mul(zelf: PyRef<Self>, value: isize, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
-        if value == 1 && zelf.class().is(&vm.ctx.types.bytes_type) {
+        if value == 1 && zelf.class().is(vm.ctx.types.bytes_type) {
             // Special case: when some `bytes` is multiplied by `1`,
             // nothing really happens, we need to return an object itself
             // with the same `id()` to be compatible with CPython.
             // This only works for `bytes` itself, not its subclasses.
             return Ok(zelf);
         }
-        // todo: map err to overflow.
-        vm.check_repeat_or_memory_error(zelf.inner.len(), value)
-            .map(|value| {
-                let bytes: PyBytes = zelf.inner.repeat(value).into();
-                bytes.into_ref(vm)
-            })
-            // see issue 45044 on b.p.o.
-            .map_err(|_| vm.new_overflow_error("repeated bytes are too long".to_owned()))
+        zelf.inner
+            .mul(value, vm)
+            .map(|x| Self::from(x).into_ref(vm))
     }
 
     #[pymethod(name = "__mod__")]
@@ -509,7 +524,7 @@ impl PyBytes {
             .inner
             .elements
             .iter()
-            .map(|x| x.into_pyobject(vm))
+            .map(|x| x.to_pyobject(vm))
             .collect();
         PyTuple::new_ref(param, &vm.ctx)
     }
@@ -528,9 +543,9 @@ impl PyBytes {
         zelf: PyRef<Self>,
         vm: &VirtualMachine,
     ) -> (PyTypeRef, PyTupleRef, Option<PyDictRef>) {
-        let bytes = PyBytes::from(zelf.inner.elements.clone()).into_pyobject(vm);
+        let bytes = PyBytes::from(zelf.inner.elements.clone()).to_pyobject(vm);
         (
-            zelf.as_object().clone_class(),
+            zelf.class().clone(),
             PyTuple::new_ref(vec![bytes], &vm.ctx),
             zelf.as_object().dict(),
         )
@@ -545,9 +560,9 @@ static BUFFER_METHODS: BufferMethods = BufferMethods {
 };
 
 impl AsBuffer for PyBytes {
-    fn as_buffer(zelf: &PyObjectView<Self>, _vm: &VirtualMachine) -> PyResult<PyBuffer> {
+    fn as_buffer(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<PyBuffer> {
         let buf = PyBuffer::new(
-            zelf.to_owned().into_object(),
+            zelf.to_owned().into(),
             BufferDescriptor::simple(zelf.len(), true),
             &BUFFER_METHODS,
         );
@@ -556,52 +571,74 @@ impl AsBuffer for PyBytes {
 }
 
 impl AsMapping for PyBytes {
-    fn as_mapping(_zelf: &PyObjectView<Self>, _vm: &VirtualMachine) -> PyMappingMethods {
-        PyMappingMethods {
-            length: Some(Self::length),
-            subscript: Some(Self::subscript),
-            ass_subscript: None,
-        }
-    }
+    const AS_MAPPING: PyMappingMethods = PyMappingMethods {
+        length: Some(|mapping, _vm| Ok(Self::mapping_downcast(mapping).len())),
+        subscript: Some(|mapping, needle, vm| Self::mapping_downcast(mapping)._getitem(needle, vm)),
+        ass_subscript: None,
+    };
+}
 
-    #[inline]
-    fn length(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
-        Self::downcast_ref(&zelf, vm).map(|zelf| Ok(zelf.len()))?
-    }
+impl AsSequence for PyBytes {
+    const AS_SEQUENCE: PySequenceMethods = PySequenceMethods {
+        length: Some(|seq, _vm| Ok(Self::sequence_downcast(seq).len())),
+        concat: Some(|seq, other, vm| {
+            Self::sequence_downcast(seq)
+                .inner
+                .concat(other, vm)
+                .map(|x| vm.ctx.new_bytes(x).into())
+        }),
+        repeat: Some(|seq, n, vm| {
+            Ok(vm
+                .ctx
+                .new_bytes(Self::sequence_downcast(seq).repeat(n))
+                .into())
+        }),
+        item: Some(|seq, i, vm| {
+            Self::sequence_downcast(seq)
+                .inner
+                .elements
+                .getitem_by_index(vm, i)
+                .map(|x| vm.ctx.new_bytes(vec![x]).into())
+        }),
+        contains: Some(|seq, other, vm| {
+            let other = <Either<PyBytesInner, PyIntRef>>::try_from_object(vm, other.to_owned())?;
+            Self::sequence_downcast(seq).contains(other, vm)
+        }),
+        ..PySequenceMethods::NOT_IMPLEMENTED
+    };
+}
 
-    #[inline]
-    fn subscript(zelf: PyObjectRef, needle: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        Self::downcast_ref(&zelf, vm).map(|zelf| zelf.getitem(needle, vm))?
-    }
-
-    #[cold]
-    fn ass_subscript(
-        zelf: PyObjectRef,
-        _needle: PyObjectRef,
-        _value: Option<PyObjectRef>,
-        _vm: &VirtualMachine,
-    ) -> PyResult<()> {
-        unreachable!("ass_subscript not implemented for {}", zelf.class())
+impl AsNumber for PyBytes {
+    fn as_number() -> &'static PyNumberMethods {
+        static AS_NUMBER: PyNumberMethods = PyNumberMethods {
+            remainder: atomic_func!(|number, other, vm| {
+                PyBytes::number_downcast(number)
+                    .mod_(other.to_owned(), vm)
+                    .to_pyresult(vm)
+            }),
+            ..PyNumberMethods::NOT_IMPLEMENTED
+        };
+        &AS_NUMBER
     }
 }
 
 impl Hashable for PyBytes {
     #[inline]
-    fn hash(zelf: &crate::PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyHash> {
+    fn hash(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyHash> {
         Ok(zelf.inner.hash(vm))
     }
 }
 
 impl Comparable for PyBytes {
     fn cmp(
-        zelf: &crate::PyObjectView<Self>,
+        zelf: &crate::Py<Self>,
         other: &PyObject,
         op: PyComparisonOp,
         vm: &VirtualMachine,
     ) -> PyResult<PyComparisonValue> {
         Ok(if let Some(res) = op.identical_optimization(zelf, other) {
             res.into()
-        } else if other.isinstance(&vm.ctx.types.memoryview_type)
+        } else if other.fast_isinstance(vm.ctx.types.memoryview_type)
             && op != PyComparisonOp::Eq
             && op != PyComparisonOp::Ne
         {
@@ -622,7 +659,7 @@ impl Iterable for PyBytes {
         Ok(PyBytesIterator {
             internal: PyMutex::new(PositionIterInternal::new(zelf, 0)),
         }
-        .into_object(vm))
+        .into_pyobject(vm))
     }
 }
 
@@ -632,13 +669,13 @@ pub struct PyBytesIterator {
     internal: PyMutex<PositionIterInternal<PyBytesRef>>,
 }
 
-impl PyValue for PyBytesIterator {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.bytes_iterator_type
+impl PyPayload for PyBytesIterator {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.bytes_iterator_type
     }
 }
 
-#[pyimpl(with(Constructor, IterNext))]
+#[pyclass(with(Constructor, IterNext))]
 impl PyBytesIterator {
     #[pymethod(magic)]
     fn length_hint(&self) -> usize {
@@ -663,7 +700,7 @@ impl Unconstructible for PyBytesIterator {}
 
 impl IterNextIterable for PyBytesIterator {}
 impl IterNext for PyBytesIterator {
-    fn next(zelf: &crate::PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+    fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         zelf.internal.lock().next(|bytes, pos| {
             Ok(PyIterReturn::from_result(
                 bytes

@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 from test import support
 from test.support import os_helper
+from test.support import warnings_helper
 import os
 try:
     import ssl
@@ -51,7 +52,7 @@ def urlopen(url, data=None, proxies=None):
 
 
 def FancyURLopener():
-    with support.check_warnings(
+    with warnings_helper.check_warnings(
             ('FancyURLopener style of invoking requests is deprecated.',
             DeprecationWarning)):
         return urllib.request.FancyURLopener()
@@ -202,7 +203,6 @@ class urlopen_FileTests(unittest.TestCase):
     def test_url(self):
         self.assertEqual(self.returned_obj.url, self.quoted_pathname)
 
-    @unittest.skip("TODO: RUSTPYTHON (AttributeError: 'BufferedReader' object has no attribute 'status')")
     def test_status(self):
         self.assertIsNone(self.returned_obj.status)
 
@@ -372,8 +372,6 @@ class urlopen_HttpTests(unittest.TestCase, FakeHTTPMixin, FakeFTPMixin):
         finally:
             self.unfakehttp()
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     @unittest.skipUnless(ssl, "ssl module required")
     def test_url_path_with_control_char_rejected(self):
         for char_no in list(range(0, 0x21)) + [0x7f]:
@@ -401,8 +399,6 @@ class urlopen_HttpTests(unittest.TestCase, FakeHTTPMixin, FakeFTPMixin):
             finally:
                 self.unfakehttp()
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     @unittest.skipUnless(ssl, "ssl module required")
     def test_url_path_with_newline_header_injection_rejected(self):
         self.fakehttp(b"HTTP/1.1 200 OK\r\n\r\nHello.")
@@ -429,8 +425,6 @@ class urlopen_HttpTests(unittest.TestCase, FakeHTTPMixin, FakeFTPMixin):
         finally:
             self.unfakehttp()
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     @unittest.skipUnless(ssl, "ssl module required")
     def test_url_host_with_control_char_rejected(self):
         for char_no in list(range(0, 0x21)) + [0x7f]:
@@ -448,8 +442,6 @@ class urlopen_HttpTests(unittest.TestCase, FakeHTTPMixin, FakeFTPMixin):
             finally:
                 self.unfakehttp()
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     @unittest.skipUnless(ssl, "ssl module required")
     def test_url_host_with_newline_header_injection_rejected(self):
         self.fakehttp(b"HTTP/1.1 200 OK\r\n\r\nHello.")
@@ -602,20 +594,19 @@ Connection: close
             self.unfakehttp()
 
     def test_URLopener_deprecation(self):
-        with support.check_warnings(('',DeprecationWarning)):
+        with warnings_helper.check_warnings(('',DeprecationWarning)):
             urllib.request.URLopener()
 
     @unittest.skipUnless(ssl, "ssl module required")
     def test_cafile_and_context(self):
         context = ssl.create_default_context()
-        with support.check_warnings(('', DeprecationWarning)):
+        with warnings_helper.check_warnings(('', DeprecationWarning)):
             with self.assertRaises(ValueError):
                 urllib.request.urlopen(
                     "https://localhost", cafile="/nonexistent/path", context=context
                 )
 
 
-@unittest.skip("TODO: RUSTPYTHON, error in setUp(); ValueError: error decoding base64: Invalid byte 32, offset 95.")
 class urlopen_DataTests(unittest.TestCase):
     """Test urlopen() opening a data URL."""
 
@@ -1274,7 +1265,6 @@ class UnquotingTests(unittest.TestCase):
         self.assertEqual(expect, result,
                          "using unquote(): %r != %r" % (expect, result))
 
-    @unittest.skip("TODO: RUSTPYTHON (TypeError: Expected str, got bytes)")
     def test_unquoting_with_bytes_input(self):
         # ASCII characters decoded to a string
         given = b'blueberryjam'
@@ -1536,6 +1526,8 @@ class Pathname_Tests(unittest.TestCase):
                          "url2pathname() failed; %s != %s" %
                          (expect, result))
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     @unittest.skipUnless(sys.platform == 'win32',
                          'test specific to the nturl2path functions.')
     def test_prefixes(self):
@@ -1586,7 +1578,7 @@ class URLopener_Tests(FakeHTTPMixin, unittest.TestCase):
         class DummyURLopener(urllib.request.URLopener):
             def open_spam(self, url):
                 return url
-        with support.check_warnings(
+        with warnings_helper.check_warnings(
                 ('DummyURLopener style of invoking requests is deprecated.',
                 DeprecationWarning)):
             self.assertEqual(DummyURLopener().open(
@@ -1597,7 +1589,7 @@ class URLopener_Tests(FakeHTTPMixin, unittest.TestCase):
                 "spam://c:|windows%/:=&?~#+!$,;'@()*[]|/path/"),
                 "//c:|windows%/:=&?~#+!$,;'@()*[]|/path/")
 
-    @support.ignore_warnings(category=DeprecationWarning)
+    @warnings_helper.ignore_warnings(category=DeprecationWarning)
     def test_urlopener_retrieve_file(self):
         with os_helper.temp_dir() as tmpdir:
             fd, tmpfile = tempfile.mkstemp(dir=tmpdir)
@@ -1607,7 +1599,7 @@ class URLopener_Tests(FakeHTTPMixin, unittest.TestCase):
             # Some buildbots have TEMP folder that uses a lowercase drive letter.
             self.assertEqual(os.path.normcase(filename), os.path.normcase(tmpfile))
 
-    @support.ignore_warnings(category=DeprecationWarning)
+    @warnings_helper.ignore_warnings(category=DeprecationWarning)
     def test_urlopener_retrieve_remote(self):
         url = "http://www.python.org/file.txt"
         self.fakehttp(b"HTTP/1.1 200 OK\r\n\r\nHello!")
@@ -1615,7 +1607,7 @@ class URLopener_Tests(FakeHTTPMixin, unittest.TestCase):
         filename, _ = urllib.request.URLopener().retrieve(url)
         self.assertEqual(os.path.splitext(filename)[1], ".txt")
 
-    @support.ignore_warnings(category=DeprecationWarning)
+    @warnings_helper.ignore_warnings(category=DeprecationWarning)
     def test_local_file_open(self):
         # bpo-35907, CVE-2019-9948: urllib must reject local_file:// scheme
         class DummyURLopener(urllib.request.URLopener):

@@ -5,6 +5,7 @@ import sys
 import types
 import pickle
 from test import support
+from test.support import import_helper
 import test.test_importlib.util
 
 import unittest
@@ -498,8 +499,6 @@ class TestDiscovery(unittest.TestCase):
         with self.assertRaises(ImportError):
             test.test_this_does_not_exist()
 
-    # TODO: RUSTPYTHON ImportError.__reduce__ missing
-    @unittest.expectedFailure
     def test_discover_with_init_modules_that_fail_to_import(self):
         vfs = {abspath('/foo'): ['my_package'],
                abspath('/foo/my_package'): ['__init__.py', 'test_module.py']}
@@ -725,11 +724,13 @@ class TestDiscovery(unittest.TestCase):
         original_listdir = os.listdir
         original_isfile = os.path.isfile
         original_isdir = os.path.isdir
+        original_realpath = os.path.realpath
 
         def cleanup():
             os.listdir = original_listdir
             os.path.isfile = original_isfile
             os.path.isdir = original_isdir
+            os.path.realpath = original_realpath
             del sys.modules['foo']
             if full_path in sys.path:
                 sys.path.remove(full_path)
@@ -744,6 +745,10 @@ class TestDiscovery(unittest.TestCase):
         os.listdir = listdir
         os.path.isfile = isfile
         os.path.isdir = isdir
+        if os.name == 'nt':
+            # ntpath.realpath may inject path prefixes when failing to
+            # resolve real files, so we substitute abspath() here instead.
+            os.path.realpath = os.path.abspath
         return full_path
 
     def test_detect_module_clash(self):
@@ -844,7 +849,7 @@ class TestDiscovery(unittest.TestCase):
 
         with unittest.mock.patch('builtins.__import__', _import):
             # Since loader.discover() can modify sys.path, restore it when done.
-            with support.DirsOnSysPath():
+            with import_helper.DirsOnSysPath():
                 # Make sure to remove 'package' from sys.modules when done.
                 with test.test_importlib.util.uncache('package'):
                     suite = loader.discover('package')
@@ -861,7 +866,7 @@ class TestDiscovery(unittest.TestCase):
 
         with unittest.mock.patch('builtins.__import__', _import):
             # Since loader.discover() can modify sys.path, restore it when done.
-            with support.DirsOnSysPath():
+            with import_helper.DirsOnSysPath():
                 # Make sure to remove 'package' from sys.modules when done.
                 with test.test_importlib.util.uncache('package'):
                     with self.assertRaises(TypeError) as cm:

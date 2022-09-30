@@ -1,9 +1,10 @@
-use super::{pytype, PyClassMethod, PyStr, PyStrRef, PyTypeRef};
+use super::{type_, PyClassMethod, PyStaticMethod, PyStr, PyStrRef, PyType};
 use crate::{
     builtins::PyBoundMethod,
+    class::PyClassImpl,
     function::{FuncArgs, IntoPyNativeFunc, PyNativeFunc},
     types::{Callable, Constructor, GetDescriptor, Unconstructible},
-    PyClassImpl, PyContext, PyObjectRef, PyRef, PyResult, PyValue, TypeProtocol, VirtualMachine,
+    AsObject, Context, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
 };
 use std::fmt;
 
@@ -22,7 +23,7 @@ impl PyNativeFuncDef {
         }
     }
 
-    pub fn with_doc(mut self, doc: String, ctx: &PyContext) -> Self {
+    pub fn with_doc(mut self, doc: String, ctx: &Context) -> Self {
         self.doc = Some(PyStr::new_ref(doc, ctx));
         self
     }
@@ -30,20 +31,32 @@ impl PyNativeFuncDef {
     pub fn into_function(self) -> PyBuiltinFunction {
         self.into()
     }
-    pub fn build_function(self, ctx: &PyContext) -> PyRef<PyBuiltinFunction> {
+    pub fn build_function(self, ctx: &Context) -> PyRef<PyBuiltinFunction> {
         self.into_function().into_ref(ctx)
     }
-    pub fn build_method(self, ctx: &PyContext, class: PyTypeRef) -> PyRef<PyBuiltinMethod> {
+    pub fn build_method(self, ctx: &Context, class: &'static Py<PyType>) -> PyRef<PyBuiltinMethod> {
         PyRef::new_ref(
             PyBuiltinMethod { value: self, class },
-            ctx.types.method_descriptor_type.clone(),
+            ctx.types.method_descriptor_type.to_owned(),
             None,
         )
     }
-    pub fn build_classmethod(self, ctx: &PyContext, class: PyTypeRef) -> PyRef<PyClassMethod> {
+    pub fn build_classmethod(
+        self,
+        ctx: &Context,
+        class: &'static Py<PyType>,
+    ) -> PyRef<PyClassMethod> {
         // TODO: classmethod_descriptor
         let callable = self.build_method(ctx, class).into();
         PyClassMethod::new_ref(callable, ctx)
+    }
+    pub fn build_staticmethod(
+        self,
+        ctx: &Context,
+        class: &'static Py<PyType>,
+    ) -> PyRef<PyStaticMethod> {
+        let callable = self.build_method(ctx, class).into();
+        PyStaticMethod::new_ref(callable, ctx)
     }
 }
 
@@ -53,9 +66,9 @@ pub struct PyBuiltinFunction {
     module: Option<PyObjectRef>,
 }
 
-impl PyValue for PyBuiltinFunction {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.builtin_function_or_method_type
+impl PyPayload for PyBuiltinFunction {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.builtin_function_or_method_type
     }
 }
 
@@ -80,10 +93,10 @@ impl PyBuiltinFunction {
         self
     }
 
-    pub fn into_ref(self, ctx: &PyContext) -> PyRef<Self> {
+    pub fn into_ref(self, ctx: &Context) -> PyRef<Self> {
         PyRef::new_ref(
             self,
-            ctx.types.builtin_function_or_method_type.clone(),
+            ctx.types.builtin_function_or_method_type.to_owned(),
             None,
         )
     }
@@ -96,30 +109,30 @@ impl PyBuiltinFunction {
 impl Callable for PyBuiltinFunction {
     type Args = FuncArgs;
     #[inline]
-    fn call(zelf: &crate::PyObjectView<Self>, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    fn call(zelf: &crate::Py<Self>, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         (zelf.value.func)(vm, args)
     }
 }
 
-#[pyimpl(with(Callable, Constructor), flags(HAS_DICT))]
+#[pyclass(with(Callable, Constructor), flags(HAS_DICT))]
 impl PyBuiltinFunction {
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn module(&self, vm: &VirtualMachine) -> PyObjectRef {
         vm.unwrap_or_none(self.module.clone())
     }
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn name(&self) -> PyStrRef {
         self.value.name.clone()
     }
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn qualname(&self) -> PyStrRef {
         self.name()
     }
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn doc(&self) -> Option<PyStrRef> {
         self.value.doc.clone()
     }
-    #[pyproperty(name = "__self__")]
+    #[pygetset(name = "__self__")]
     fn get_self(&self, vm: &VirtualMachine) -> PyObjectRef {
         vm.ctx.none()
     }
@@ -136,10 +149,10 @@ impl PyBuiltinFunction {
     fn repr(&self) -> String {
         format!("<built-in function {}>", self.value.name)
     }
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn text_signature(&self) -> Option<String> {
         self.value.doc.as_ref().and_then(|doc| {
-            pytype::get_text_signature_from_internal_doc(self.value.name.as_str(), doc.as_str())
+            type_::get_text_signature_from_internal_doc(self.value.name.as_str(), doc.as_str())
                 .map(|signature| signature.to_string())
         })
     }
@@ -155,12 +168,12 @@ impl Unconstructible for PyBuiltinFunction {}
 #[pyclass(module = false, name = "method_descriptor")]
 pub struct PyBuiltinMethod {
     value: PyNativeFuncDef,
-    class: PyTypeRef,
+    class: &'static Py<PyType>,
 }
 
-impl PyValue for PyBuiltinMethod {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.method_descriptor_type
+impl PyPayload for PyBuiltinMethod {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.method_descriptor_type
     }
 }
 
@@ -193,7 +206,7 @@ impl GetDescriptor for PyBuiltinMethod {
 impl Callable for PyBuiltinMethod {
     type Args = FuncArgs;
     #[inline]
-    fn call(zelf: &crate::PyObjectView<Self>, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    fn call(zelf: &crate::Py<Self>, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         (zelf.value.func)(vm, args)
     }
 }
@@ -201,9 +214,9 @@ impl Callable for PyBuiltinMethod {
 impl PyBuiltinMethod {
     pub fn new_ref<F, FKind>(
         name: impl Into<PyStr>,
-        class: PyTypeRef,
+        class: &'static Py<PyType>,
         f: F,
-        ctx: &PyContext,
+        ctx: &Context,
     ) -> PyRef<Self>
     where
         F: IntoPyNativeFunc<FKind>,
@@ -212,24 +225,24 @@ impl PyBuiltinMethod {
     }
 }
 
-#[pyimpl(with(GetDescriptor, Callable, Constructor), flags(METHOD_DESCR))]
+#[pyclass(with(GetDescriptor, Callable, Constructor), flags(METHOD_DESCR))]
 impl PyBuiltinMethod {
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn name(&self) -> PyStrRef {
         self.value.name.clone()
     }
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn qualname(&self) -> String {
         format!("{}.{}", self.class.name(), &self.value.name)
     }
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn doc(&self) -> Option<PyStrRef> {
         self.value.doc.clone()
     }
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn text_signature(&self) -> Option<String> {
         self.value.doc.as_ref().and_then(|doc| {
-            pytype::get_text_signature_from_internal_doc(self.value.name.as_str(), doc.as_str())
+            type_::get_text_signature_from_internal_doc(self.value.name.as_str(), doc.as_str())
                 .map(|signature| signature.to_string())
         })
     }
@@ -244,7 +257,7 @@ impl PyBuiltinMethod {
 }
 impl Unconstructible for PyBuiltinMethod {}
 
-pub fn init(context: &PyContext) {
-    PyBuiltinFunction::extend_class(context, &context.types.builtin_function_or_method_type);
-    PyBuiltinMethod::extend_class(context, &context.types.method_descriptor_type);
+pub fn init(context: &Context) {
+    PyBuiltinFunction::extend_class(context, context.types.builtin_function_or_method_type);
+    PyBuiltinMethod::extend_class(context, context.types.method_descriptor_type);
 }

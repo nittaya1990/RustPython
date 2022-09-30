@@ -3,8 +3,7 @@ pub(crate) use _bisect::make_module;
 #[pymodule]
 mod _bisect {
     use crate::vm::{
-        function::OptionalArg, types::PyComparisonOp::Lt, ItemProtocol, PyObjectRef, PyResult,
-        VirtualMachine,
+        function::OptionalArg, types::PyComparisonOp, PyObjectRef, PyResult, VirtualMachine,
     };
 
     #[derive(FromArgs)]
@@ -15,6 +14,8 @@ mod _bisect {
         lo: OptionalArg<PyObjectRef>,
         #[pyarg(any, optional)]
         hi: OptionalArg<PyObjectRef>,
+        #[pyarg(named, default)]
+        key: Option<PyObjectRef>,
     }
 
     // Handles objects that implement __index__ and makes sure index fits in needed isize.
@@ -23,10 +24,9 @@ mod _bisect {
         arg: OptionalArg<PyObjectRef>,
         vm: &VirtualMachine,
     ) -> PyResult<Option<isize>> {
-        Ok(match arg {
-            OptionalArg::Present(v) => Some(vm.to_index(&v)?.try_to_primitive(vm)?),
-            OptionalArg::Missing => None,
-        })
+        arg.into_option()
+            .map(|v| v.try_index(vm)?.try_to_primitive(vm))
+            .transpose()
     }
 
     // Handles defaults for lo, hi.
@@ -68,7 +68,7 @@ mod _bisect {
     #[inline]
     #[pyfunction]
     fn bisect_left(
-        BisectArgs { a, x, lo, hi }: BisectArgs,
+        BisectArgs { a, x, lo, hi, key }: BisectArgs,
         vm: &VirtualMachine,
     ) -> PyResult<usize> {
         let (mut lo, mut hi) = as_usize(lo, hi, a.length(vm)?, vm)?;
@@ -76,7 +76,13 @@ mod _bisect {
         while lo < hi {
             // Handles issue 13496.
             let mid = (lo + hi) / 2;
-            if a.get_item(mid, vm)?.rich_compare_bool(&x, Lt, vm)? {
+            let a_mid = a.get_item(&mid, vm)?;
+            let comp = if let Some(ref key) = key {
+                vm.invoke(key, (a_mid,))?
+            } else {
+                a_mid
+            };
+            if comp.rich_compare_bool(&x, PyComparisonOp::Lt, vm)? {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -96,7 +102,7 @@ mod _bisect {
     #[inline]
     #[pyfunction]
     fn bisect_right(
-        BisectArgs { a, x, lo, hi }: BisectArgs,
+        BisectArgs { a, x, lo, hi, key }: BisectArgs,
         vm: &VirtualMachine,
     ) -> PyResult<usize> {
         let (mut lo, mut hi) = as_usize(lo, hi, a.length(vm)?, vm)?;
@@ -104,7 +110,13 @@ mod _bisect {
         while lo < hi {
             // Handles issue 13496.
             let mid = (lo + hi) / 2;
-            if x.rich_compare_bool(&*a.get_item(mid, vm)?, Lt, vm)? {
+            let a_mid = a.get_item(&mid, vm)?;
+            let comp = if let Some(ref key) = key {
+                vm.invoke(key, (a_mid,))?
+            } else {
+                a_mid
+            };
+            if x.rich_compare_bool(&comp, PyComparisonOp::Lt, vm)? {
                 hi = mid;
             } else {
                 lo = mid + 1;
@@ -120,13 +132,19 @@ mod _bisect {
     /// Optional args lo (default 0) and hi (default len(a)) bound the
     /// slice of a to be searched.
     #[pyfunction]
-    fn insort_left(BisectArgs { a, x, lo, hi }: BisectArgs, vm: &VirtualMachine) -> PyResult {
+    fn insort_left(BisectArgs { a, x, lo, hi, key }: BisectArgs, vm: &VirtualMachine) -> PyResult {
+        let x = if let Some(ref key) = key {
+            vm.invoke(key, (x,))?
+        } else {
+            x
+        };
         let index = bisect_left(
             BisectArgs {
                 a: a.clone(),
                 x: x.clone(),
                 lo,
                 hi,
+                key,
             },
             vm,
         )?;
@@ -140,13 +158,19 @@ mod _bisect {
     /// Optional args lo (default 0) and hi (default len(a)) bound the
     /// slice of a to be searched
     #[pyfunction]
-    fn insort_right(BisectArgs { a, x, lo, hi }: BisectArgs, vm: &VirtualMachine) -> PyResult {
+    fn insort_right(BisectArgs { a, x, lo, hi, key }: BisectArgs, vm: &VirtualMachine) -> PyResult {
+        let x = if let Some(ref key) = key {
+            vm.invoke(key, (x,))?
+        } else {
+            x
+        };
         let index = bisect_right(
             BisectArgs {
                 a: a.clone(),
                 x: x.clone(),
                 lo,
                 hi,
+                key,
             },
             vm,
         )?;

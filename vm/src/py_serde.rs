@@ -3,8 +3,8 @@ use num_traits::sign::Signed;
 use serde::de::{DeserializeSeed, Visitor};
 use serde::ser::{Serialize, SerializeMap, SerializeSeq};
 
-use crate::builtins::{dict::PyDictRef, float, int, list::PyList, pybool, tuple::PyTuple, PyStr};
-use crate::{ItemProtocol, PyObject, PyObjectRef, TypeProtocol, VirtualMachine};
+use crate::builtins::{bool_, dict::PyDictRef, float, int, list::PyList, tuple::PyTuple, PyStr};
+use crate::{AsObject, PyObject, PyObjectRef, VirtualMachine};
 
 #[inline]
 pub fn serialize<S>(
@@ -57,18 +57,18 @@ impl<'s> serde::Serialize for PyObjectSerializer<'s> {
         let serialize_seq_elements =
             |serializer: S, elements: &[PyObjectRef]| -> Result<S::Ok, S::Error> {
                 let mut seq = serializer.serialize_seq(Some(elements.len()))?;
-                for e in elements.iter() {
+                for e in elements {
                     seq.serialize_element(&self.clone_with_object(e))?;
                 }
                 seq.end()
             };
         if let Some(s) = self.pyobject.payload::<PyStr>() {
             serializer.serialize_str(s.as_ref())
-        } else if self.pyobject.isinstance(&self.vm.ctx.types.float_type) {
+        } else if self.pyobject.fast_isinstance(self.vm.ctx.types.float_type) {
             serializer.serialize_f64(float::get_value(self.pyobject))
-        } else if self.pyobject.isinstance(&self.vm.ctx.types.bool_type) {
-            serializer.serialize_bool(pybool::get_value(self.pyobject))
-        } else if self.pyobject.isinstance(&self.vm.ctx.types.int_type) {
+        } else if self.pyobject.fast_isinstance(self.vm.ctx.types.bool_type) {
+            serializer.serialize_bool(bool_::get_value(self.pyobject))
+        } else if self.pyobject.fast_isinstance(self.vm.ctx.types.int_type) {
             let v = int::get_value(self.pyobject);
             let int_too_large = || serde::ser::Error::custom("int too large to serialize");
             // TODO: serialize BigInt when it does not fit into i64
@@ -83,12 +83,12 @@ impl<'s> serde::Serialize for PyObjectSerializer<'s> {
         } else if let Some(list) = self.pyobject.payload_if_subclass::<PyList>(self.vm) {
             serialize_seq_elements(serializer, &list.borrow_vec())
         } else if let Some(tuple) = self.pyobject.payload_if_subclass::<PyTuple>(self.vm) {
-            serialize_seq_elements(serializer, tuple.as_slice())
-        } else if self.pyobject.isinstance(&self.vm.ctx.types.dict_type) {
+            serialize_seq_elements(serializer, tuple)
+        } else if self.pyobject.fast_isinstance(self.vm.ctx.types.dict_type) {
             let dict: PyDictRef = self.pyobject.to_owned().downcast().unwrap();
             let pairs: Vec<_> = dict.into_iter().collect();
             let mut map = serializer.serialize_map(Some(pairs.len()))?;
-            for (key, e) in pairs.iter() {
+            for (key, e) in &pairs {
                 map.serialize_entry(&self.clone_with_object(key), &self.clone_with_object(e))?;
             }
             map.end()
@@ -103,7 +103,7 @@ impl<'s> serde::Serialize for PyObjectSerializer<'s> {
     }
 }
 
-// This object is used as the seed for deserialization so we have access to the PyContext for type
+// This object is used as the seed for deserialization so we have access to the Context for type
 // creation
 #[derive(Clone)]
 pub struct PyObjectDeserializer<'c> {
@@ -205,7 +205,7 @@ impl<'de> Visitor<'de> for PyObjectDeserializer<'de> {
         // Although JSON keys must be strings, implementation accepts any keys
         // and can be reused by other deserializers without such limit
         while let Some((key_obj, value)) = access.next_entry_seed(self.clone(), self.clone())? {
-            dict.set_item(key_obj, value, self.vm).unwrap();
+            dict.set_item(&*key_obj, value, self.vm).unwrap();
         }
         Ok(dict.into())
     }

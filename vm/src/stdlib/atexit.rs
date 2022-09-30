@@ -1,8 +1,9 @@
+pub use atexit::_run_exitfuncs;
 pub(crate) use atexit::make_module;
 
 #[pymodule]
 mod atexit {
-    use crate::{function::FuncArgs, PyObjectRef, PyResult, VirtualMachine};
+    use crate::{function::FuncArgs, AsObject, PyObjectRef, PyResult, VirtualMachine};
 
     #[pyfunction]
     fn register(func: PyObjectRef, args: FuncArgs, vm: &VirtualMachine) -> PyObjectRef {
@@ -32,8 +33,17 @@ mod atexit {
     }
 
     #[pyfunction]
-    fn _run_exitfuncs(vm: &VirtualMachine) -> PyResult<()> {
-        vm.run_atexit_funcs()
+    pub fn _run_exitfuncs(vm: &VirtualMachine) {
+        let funcs: Vec<_> = std::mem::take(&mut *vm.state.atexit_funcs.lock());
+        for (func, args) in funcs.into_iter().rev() {
+            if let Err(e) = vm.invoke(&func, args) {
+                let exit = e.fast_isinstance(vm.ctx.exceptions.system_exit);
+                vm.run_unraisable(e, Some("Error in atexit._run_exitfuncs".to_owned()), func);
+                if exit {
+                    break;
+                }
+            }
+        }
     }
 
     #[pyfunction]

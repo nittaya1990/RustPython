@@ -5,8 +5,8 @@ mod zlib {
     use crate::common::lock::PyMutex;
     use crate::vm::{
         builtins::{PyBaseExceptionRef, PyBytes, PyBytesRef, PyIntRef, PyTypeRef},
-        function::{ArgBytesLike, OptionalArg},
-        IntoPyRef, PyResult, PyValue, VirtualMachine,
+        function::{ArgBytesLike, OptionalArg, OptionalOption},
+        PyPayload, PyResult, VirtualMachine,
     };
     use adler32::RollingAdler32 as Adler32;
     use crossbeam_utils::atomic::AtomicCell;
@@ -58,7 +58,7 @@ mod zlib {
         vm.ctx.new_exception_type(
             "zlib",
             "error",
-            Some(vec![vm.ctx.exceptions.exception_type.clone()]),
+            Some(vec![vm.ctx.exceptions.exception_type.to_owned()]),
         )
     }
 
@@ -90,14 +90,21 @@ mod zlib {
         }
     }
 
+    #[derive(FromArgs)]
+    struct PyFuncCompressArgs {
+        #[pyarg(positional)]
+        data: ArgBytesLike,
+        #[pyarg(any, optional)]
+        level: OptionalOption<i32>,
+    }
+
     /// Returns a bytes object containing compressed data.
     #[pyfunction]
-    fn compress(
-        data: ArgBytesLike,
-        level: OptionalArg<i32>,
-        vm: &VirtualMachine,
-    ) -> PyResult<PyBytesRef> {
-        let compression = compression_from_int(level.into_option())
+    fn compress(args: PyFuncCompressArgs, vm: &VirtualMachine) -> PyResult<PyBytesRef> {
+        let data = args.data;
+        let level = args.level;
+
+        let compression = compression_from_int(level.flatten())
             .ok_or_else(|| new_zlib_error("Bad compression level", vm))?;
 
         let mut encoder = ZlibEncoder::new(Vec::new(), compression);
@@ -147,7 +154,7 @@ mod zlib {
     fn header_from_wbits(wbits: OptionalArg<i8>, vm: &VirtualMachine) -> PyResult<InitOptions> {
         let wbits = wbits.unwrap_or(MAX_WBITS as i8);
         let header = wbits > 0;
-        let wbits = wbits.abs() as u8;
+        let wbits = wbits.unsigned_abs();
         match wbits {
             9..=15 => Ok(InitOptions::Standard {
                 header,
@@ -223,14 +230,22 @@ mod zlib {
         }
     }
 
+    #[derive(FromArgs)]
+    struct PyFuncDecompressArgs {
+        #[pyarg(positional)]
+        data: ArgBytesLike,
+        #[pyarg(any, optional)]
+        wbits: OptionalArg<i8>,
+        #[pyarg(any, optional)]
+        bufsize: OptionalArg<usize>,
+    }
+
     /// Returns a bytes object containing the uncompressed data.
     #[pyfunction]
-    fn decompress(
-        data: ArgBytesLike,
-        wbits: OptionalArg<i8>,
-        bufsize: OptionalArg<usize>,
-        vm: &VirtualMachine,
-    ) -> PyResult<Vec<u8>> {
+    fn decompress(arg: PyFuncDecompressArgs, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
+        let data = arg.data;
+        let wbits = arg.wbits;
+        let bufsize = arg.bufsize;
         data.with_ref(|data| {
             let bufsize = bufsize.unwrap_or(DEF_BUF_SIZE);
 
@@ -266,24 +281,24 @@ mod zlib {
     }
     #[pyattr]
     #[pyclass(name = "Decompress")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct PyDecompress {
         decompress: PyMutex<Decompress>,
         eof: AtomicCell<bool>,
         unused_data: PyMutex<PyBytesRef>,
         unconsumed_tail: PyMutex<PyBytesRef>,
     }
-    #[pyimpl]
+    #[pyclass]
     impl PyDecompress {
-        #[pyproperty]
+        #[pygetset]
         fn eof(&self) -> bool {
             self.eof.load()
         }
-        #[pyproperty]
+        #[pygetset]
         fn unused_data(&self) -> PyBytesRef {
             self.unused_data.lock().clone()
         }
-        #[pyproperty]
+        #[pygetset]
         fn unconsumed_tail(&self) -> PyBytesRef {
             self.unconsumed_tail.lock().clone()
         }
@@ -306,7 +321,7 @@ mod zlib {
                     .chain(leftover)
                     .copied()
                     .collect();
-                *unused_data = unused.into_pyref(vm);
+                *unused_data = vm.new_pyref(unused);
             }
         }
 
@@ -351,15 +366,10 @@ mod zlib {
         #[pymethod]
         fn flush(&self, length: OptionalArg<isize>, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
             let length = match length {
-                OptionalArg::Present(l) => {
-                    if l <= 0 {
-                        return Err(
-                            vm.new_value_error("length must be greater than zero".to_owned())
-                        );
-                    } else {
-                        l as usize
-                    }
+                OptionalArg::Present(l) if l <= 0 => {
+                    return Err(vm.new_value_error("length must be greater than zero".to_owned()));
                 }
+                OptionalArg::Present(l) => l as usize,
                 OptionalArg::Missing => DEF_BUF_SIZE,
             };
 
@@ -432,12 +442,12 @@ mod zlib {
 
     #[pyattr]
     #[pyclass(name = "Compress")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct PyCompress {
         inner: PyMutex<CompressInner>,
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl PyCompress {
         #[pymethod]
         fn compress(&self, data: ArgBytesLike, vm: &VirtualMachine) -> PyResult<Vec<u8>> {

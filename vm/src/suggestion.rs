@@ -1,8 +1,8 @@
 use crate::{
     builtins::{PyStr, PyStrRef},
     exceptions::types::PyBaseExceptionRef,
-    sliceable::PySliceableSequence,
-    IdProtocol, PyObjectRef, PyObjectView, TypeProtocol, VirtualMachine,
+    sliceable::SliceableSequenceOp,
+    AsObject, Py, PyObjectRef, VirtualMachine,
 };
 use rustpython_common::str::levenshtein::{levenshtein_distance, MOVE_COST};
 use std::iter::ExactSizeIterator;
@@ -17,7 +17,7 @@ fn calculate_suggestions<'a>(
         return None;
     }
 
-    let mut suggestion: Option<&PyObjectView<PyStr>> = None;
+    let mut suggestion: Option<&Py<PyStr>> = None;
     let mut suggestion_distance = usize::MAX;
     let name = name.downcast_ref::<PyStr>()?;
 
@@ -45,30 +45,30 @@ fn calculate_suggestions<'a>(
 }
 
 pub fn offer_suggestions(exc: &PyBaseExceptionRef, vm: &VirtualMachine) -> Option<PyStrRef> {
-    if exc.class().is(&vm.ctx.exceptions.attribute_error) {
+    if exc.class().is(vm.ctx.exceptions.attribute_error) {
         let name = exc.as_object().to_owned().get_attr("name", vm).unwrap();
         let obj = exc.as_object().to_owned().get_attr("obj", vm).unwrap();
 
         calculate_suggestions(vm.dir(Some(obj)).ok()?.borrow_vec().iter(), &name)
-    } else if exc.class().is(&vm.ctx.exceptions.name_error) {
+    } else if exc.class().is(vm.ctx.exceptions.name_error) {
         let name = exc.as_object().to_owned().get_attr("name", vm).unwrap();
         let mut tb = exc.traceback().unwrap();
-        while let Some(traceback) = tb.next.clone() {
+        for traceback in tb.iter() {
             tb = traceback;
         }
 
         let varnames = tb.frame.code.clone().co_varnames(vm);
-        if let Some(suggestions) = calculate_suggestions(varnames.as_slice().iter(), &name) {
+        if let Some(suggestions) = calculate_suggestions(varnames.iter(), &name) {
             return Some(suggestions);
         };
 
-        let globals = vm.extract_elements(tb.frame.globals.as_object()).ok()?;
-        if let Some(suggestions) = calculate_suggestions(globals.as_slice().iter(), &name) {
+        let globals: Vec<_> = tb.frame.globals.as_object().try_to_value(vm).ok()?;
+        if let Some(suggestions) = calculate_suggestions(globals.iter(), &name) {
             return Some(suggestions);
         };
 
-        let builtins = vm.extract_elements(tb.frame.builtins.as_object()).ok()?;
-        calculate_suggestions(builtins.as_slice().iter(), &name)
+        let builtins: Vec<_> = tb.frame.builtins.as_object().try_to_value(vm).ok()?;
+        calculate_suggestions(builtins.iter(), &name)
     } else {
         None
     }

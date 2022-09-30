@@ -1,12 +1,10 @@
-use std::collections::HashMap;
-
-use rustpython_bytecode::{CodeObject, ConstantData, Instruction};
+use rustpython_compiler_core::{CodeObject, ConstantData, Instruction};
 use rustpython_jit::{CompiledCode, JitType};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct Function {
     code: Box<CodeObject>,
-    name: String,
     annotations: HashMap<String, StackValue>,
 }
 
@@ -107,7 +105,7 @@ impl StackMachine {
                 self.stack.push(StackValue::Map(map));
             }
             Instruction::MakeFunction(_flags) => {
-                let name = if let Some(StackValue::String(name)) = self.stack.pop() {
+                let _name = if let Some(StackValue::String(name)) = self.stack.pop() {
                     name
                 } else {
                     panic!("Expected function name")
@@ -122,27 +120,20 @@ impl StackMachine {
                 } else {
                     panic!("Expected function annotations")
                 };
-                self.stack.push(StackValue::Function(Function {
-                    name,
-                    code,
-                    annotations,
-                }));
+                self.stack
+                    .push(StackValue::Function(Function { code, annotations }));
             }
             Instruction::Duplicate => {
                 let value = self.stack.last().unwrap().clone();
                 self.stack.push(value);
             }
-            Instruction::Rotate { amount } => {
-                let mut values = Vec::new();
-
-                // Pop all values from stack:
-                values.extend(self.stack.drain(self.stack.len() - amount as usize..));
-
-                // Push top of stack back first:
-                self.stack.push(values.pop().unwrap());
-
-                // Push other value back in order:
-                self.stack.extend(values);
+            Instruction::Rotate2 => {
+                let i = self.stack.len() - 2;
+                self.stack[i..].rotate_right(1);
+            }
+            Instruction::Rotate3 => {
+                let i = self.stack.len() - 3;
+                self.stack[i..].rotate_right(1);
             }
             Instruction::ReturnValue => return true,
             _ => unimplemented!(
@@ -150,7 +141,7 @@ impl StackMachine {
                 instruction
             ),
         }
-        return false;
+        false
     }
 
     pub fn get_function(&self, name: &str) -> Function {
@@ -166,7 +157,7 @@ macro_rules! jit_function {
     ($func_name:ident => $($t:tt)*) => {
         {
             let code = rustpython_derive::py_compile!(
-                crate_name = "rustpython_bytecode",
+                crate_name = "rustpython_compiler_core",
                 source = $($t)*
             );
             let mut machine = $crate::common::StackMachine::new();

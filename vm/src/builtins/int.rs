@@ -1,20 +1,26 @@
-use super::{float, PyByteArray, PyBytes, PyStr, PyStrRef, PyTypeRef};
+use super::{float, PyByteArray, PyBytes, PyStr, PyStrRef, PyType, PyTypeRef};
 use crate::{
+    atomic_func,
     bytesinner::PyBytesInner,
+    class::PyClassImpl,
     common::hash,
+    convert::{ToPyObject, ToPyResult},
     format::FormatSpec,
-    function::{ArgIntoBool, IntoPyObject, IntoPyResult, OptionalArg, OptionalOption},
-    try_value_from_borrowed_object,
-    types::{Comparable, Constructor, Hashable, PyComparisonOp},
-    IdProtocol, PyArithmeticValue, PyClassImpl, PyComparisonValue, PyContext, PyObject,
-    PyObjectRef, PyRef, PyResult, PyValue, TryFromBorrowedObject, TypeProtocol, VirtualMachine,
+    function::{
+        ArgByteOrder, ArgIntoBool, OptionalArg, OptionalOption, PyArithmeticValue,
+        PyComparisonValue,
+    },
+    protocol::{PyNumber, PyNumberMethods},
+    types::{AsNumber, Comparable, Constructor, Hashable, PyComparisonOp},
+    AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
+    TryFromBorrowedObject, VirtualMachine,
 };
 use bstr::ByteSlice;
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, Pow, PrimInt, Signed, ToPrimitive, Zero};
-use std::fmt;
-use std::mem::size_of;
+use std::ops::Neg;
+use std::{fmt, ops::Not};
 
 /// int(x=0) -> integer
 /// int(x, base=10) -> integer
@@ -53,24 +59,24 @@ where
     }
 }
 
-impl PyValue for PyInt {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.int_type
+impl PyPayload for PyInt {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.int_type
     }
 
-    fn into_object(self, vm: &VirtualMachine) -> PyObjectRef {
+    fn into_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
         vm.ctx.new_int(self.value).into()
     }
 
     fn special_retrieve(vm: &VirtualMachine, obj: &PyObject) -> Option<PyResult<PyRef<Self>>> {
-        Some(vm.to_index(obj))
+        Some(obj.try_index(vm))
     }
 }
 
 macro_rules! impl_into_pyobject_int {
     ($($t:ty)*) => {$(
-        impl IntoPyObject for $t {
-            fn into_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
+        impl ToPyObject for $t {
+            fn to_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
                 vm.ctx.new_int(self).into()
             }
         }
@@ -83,9 +89,9 @@ macro_rules! impl_try_from_object_int {
     ($(($t:ty, $to_prim:ident),)*) => {$(
         impl TryFromBorrowedObject for $t {
             fn try_from_borrowed_object(vm: &VirtualMachine, obj: &PyObject) -> PyResult<Self> {
-                try_value_from_borrowed_object(vm, obj, |int: &PyInt| {
+                obj.try_value_with(|int: &PyInt| {
                     int.try_to_primitive(vm)
-                })
+                }, vm)
             }
         }
     )*};
@@ -157,26 +163,53 @@ fn inner_divmod(int1: &BigInt, int2: &BigInt, vm: &VirtualMachine) -> PyResult {
     Ok(vm.new_tuple((div, modulo)).into())
 }
 
-fn inner_shift<F>(int1: &BigInt, int2: &BigInt, shift_op: F, vm: &VirtualMachine) -> PyResult
+fn inner_lshift(base: &BigInt, bits: &BigInt, vm: &VirtualMachine) -> PyResult {
+    inner_shift(
+        base,
+        bits,
+        |base, bits| base << bits,
+        |bits, vm| {
+            bits.to_usize().ok_or_else(|| {
+                vm.new_overflow_error("the number is too large to convert to int".to_owned())
+            })
+        },
+        vm,
+    )
+}
+
+fn inner_rshift(base: &BigInt, bits: &BigInt, vm: &VirtualMachine) -> PyResult {
+    inner_shift(
+        base,
+        bits,
+        |base, bits| base >> bits,
+        |bits, _vm| Ok(bits.to_usize().unwrap_or(usize::MAX)),
+        vm,
+    )
+}
+
+fn inner_shift<F, S>(
+    base: &BigInt,
+    bits: &BigInt,
+    shift_op: F,
+    shift_bits: S,
+    vm: &VirtualMachine,
+) -> PyResult
 where
     F: Fn(&BigInt, usize) -> BigInt,
+    S: Fn(&BigInt, &VirtualMachine) -> PyResult<usize>,
 {
-    if int2.is_negative() {
+    if bits.is_negative() {
         Err(vm.new_value_error("negative shift count".to_owned()))
-    } else if int1.is_zero() {
+    } else if base.is_zero() {
         Ok(vm.ctx.new_int(0).into())
     } else {
-        let int2 = int2.to_usize().ok_or_else(|| {
-            vm.new_overflow_error("the number is too large to convert to int".to_owned())
-        })?;
-        Ok(vm.ctx.new_int(shift_op(int1, int2)).into())
+        shift_bits(bits, vm).map(|bits| vm.ctx.new_int(shift_op(base, bits)).into())
     }
 }
 
-#[inline]
 fn inner_truediv(i1: &BigInt, i2: &BigInt, vm: &VirtualMachine) -> PyResult {
     if i2.is_zero() {
-        return Err(vm.new_zero_division_error("integer division by zero".to_owned()));
+        return Err(vm.new_zero_division_error("division by zero".to_owned()));
     }
 
     let value = if let (Some(f1), Some(f2)) = (i2f(i1), i2f(i2)) {
@@ -212,8 +245,8 @@ impl Constructor for PyInt {
     fn py_new(cls: PyTypeRef, options: Self::Args, vm: &VirtualMachine) -> PyResult {
         let value = if let OptionalArg::Present(val) = options.val_options {
             if let OptionalArg::Present(base) = options.base {
-                let base = vm
-                    .to_index(&base)?
+                let base = base
+                    .try_index(vm)?
                     .as_bigint()
                     .to_u32()
                     .filter(|&v| v == 0 || (2..=36).contains(&v))
@@ -222,10 +255,10 @@ impl Constructor for PyInt {
                     })?;
                 try_int_radix(&val, base, vm)
             } else {
-                let val = if cls.is(&vm.ctx.types.int_type) {
+                let val = if cls.is(vm.ctx.types.int_type) {
                     match val.downcast_exact::<PyInt>(vm) {
                         Ok(i) => {
-                            return Ok(i.into_pyobject(vm));
+                            return Ok(i.to_pyobject(vm));
                         }
                         Err(val) => val,
                     }
@@ -233,7 +266,7 @@ impl Constructor for PyInt {
                     val
                 };
 
-                try_int(&val, vm)
+                val.try_int(vm).map(|x| x.as_bigint().clone())
             }
         } else if let OptionalArg::Present(_) = options.base {
             Err(vm.new_type_error("int() missing string argument".to_owned()))
@@ -241,7 +274,7 @@ impl Constructor for PyInt {
             Ok(Zero::zero())
         }?;
 
-        Self::with_value(cls, value, vm).into_pyresult(vm)
+        Self::with_value(cls, value, vm).to_pyresult(vm)
     }
 }
 
@@ -250,9 +283,9 @@ impl PyInt {
     where
         T: Into<BigInt> + ToPrimitive,
     {
-        if cls.is(&vm.ctx.types.int_type) {
+        if cls.is(vm.ctx.types.int_type) {
             Ok(vm.ctx.new_int(value))
-        } else if cls.is(&vm.ctx.types.bool_type) {
+        } else if cls.is(vm.ctx.types.bool_type) {
             Ok(vm.ctx.new_bool(!value.into().eq(&BigInt::zero())))
         } else {
             PyInt::from(value).into_ref_with_type(vm, cls)
@@ -316,7 +349,7 @@ impl PyInt {
     }
 }
 
-#[pyimpl(flags(BASETYPE), with(Comparable, Hashable, Constructor))]
+#[pyclass(flags(BASETYPE), with(Comparable, Hashable, Constructor, AsNumber))]
 impl PyInt {
     #[pymethod(name = "__radd__")]
     #[pymethod(magic)]
@@ -362,22 +395,22 @@ impl PyInt {
 
     #[pymethod(magic)]
     fn lshift(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        self.general_op(other, |a, b| inner_shift(a, b, |a, b| a << b, vm), vm)
+        self.general_op(other, |a, b| inner_lshift(a, b, vm), vm)
     }
 
     #[pymethod(magic)]
     fn rlshift(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        self.general_op(other, |a, b| inner_shift(b, a, |a, b| a << b, vm), vm)
+        self.general_op(other, |a, b| inner_lshift(b, a, vm), vm)
     }
 
     #[pymethod(magic)]
     fn rshift(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        self.general_op(other, |a, b| inner_shift(a, b, |a, b| a >> b, vm), vm)
+        self.general_op(other, |a, b| inner_rshift(a, b, vm), vm)
     }
 
     #[pymethod(magic)]
     fn rrshift(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        self.general_op(other, |a, b| inner_shift(b, a, |a, b| a >> b, vm), vm)
+        self.general_op(other, |a, b| inner_rshift(b, a, vm), vm)
     }
 
     #[pymethod(name = "__rxor__")]
@@ -398,62 +431,63 @@ impl PyInt {
         self.int_op(other, |a, b| a & b, vm)
     }
 
+    fn modpow(&self, other: PyObjectRef, modulus: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        let modulus = match modulus.payload_if_subclass::<PyInt>(vm) {
+            Some(val) => val.as_bigint(),
+            None => return Ok(vm.ctx.not_implemented()),
+        };
+        if modulus.is_zero() {
+            return Err(vm.new_value_error("pow() 3rd argument cannot be 0".to_owned()));
+        }
+
+        self.general_op(
+            other,
+            |a, b| {
+                let i = if b.is_negative() {
+                    // modular multiplicative inverse
+                    // based on rust-num/num-integer#10, should hopefully be published soon
+                    fn normalize(a: BigInt, n: &BigInt) -> BigInt {
+                        let a = a % n;
+                        if a.is_negative() {
+                            a + n
+                        } else {
+                            a
+                        }
+                    }
+                    fn inverse(a: BigInt, n: &BigInt) -> Option<BigInt> {
+                        use num_integer::*;
+                        let ExtendedGcd { gcd, x: c, .. } = a.extended_gcd(n);
+                        if gcd.is_one() {
+                            Some(normalize(c, n))
+                        } else {
+                            None
+                        }
+                    }
+                    let a = inverse(a % modulus, modulus).ok_or_else(|| {
+                        vm.new_value_error(
+                            "base is not invertible for the given modulus".to_owned(),
+                        )
+                    })?;
+                    let b = -b;
+                    a.modpow(&b, modulus)
+                } else {
+                    a.modpow(b, modulus)
+                };
+                Ok(vm.ctx.new_int(i).into())
+            },
+            vm,
+        )
+    }
+
     #[pymethod(magic)]
     fn pow(
         &self,
         other: PyObjectRef,
-        mod_val: OptionalOption<PyObjectRef>,
+        r#mod: OptionalOption<PyObjectRef>,
         vm: &VirtualMachine,
     ) -> PyResult {
-        match mod_val.flatten() {
-            Some(int_ref) => {
-                let int = match int_ref.payload_if_subclass::<PyInt>(vm) {
-                    Some(val) => val,
-                    None => return Ok(vm.ctx.not_implemented()),
-                };
-
-                let modulus = int.as_bigint();
-                if modulus.is_zero() {
-                    return Err(vm.new_value_error("pow() 3rd argument cannot be 0".to_owned()));
-                }
-                self.general_op(
-                    other,
-                    |a, b| {
-                        let i = if b.is_negative() {
-                            // modular multiplicative inverse
-                            // based on rust-num/num-integer#10, should hopefully be published soon
-                            fn normalize(a: BigInt, n: &BigInt) -> BigInt {
-                                let a = a % n;
-                                if a.is_negative() {
-                                    a + n
-                                } else {
-                                    a
-                                }
-                            }
-                            fn inverse(a: BigInt, n: &BigInt) -> Option<BigInt> {
-                                use num_integer::*;
-                                let ExtendedGcd { gcd, x: c, .. } = a.extended_gcd(n);
-                                if gcd.is_one() {
-                                    Some(normalize(c, n))
-                                } else {
-                                    None
-                                }
-                            }
-                            let a = inverse(a % modulus, modulus).ok_or_else(|| {
-                                vm.new_value_error(
-                                    "base is not invertible for the given modulus".to_owned(),
-                                )
-                            })?;
-                            let b = -b;
-                            a.modpow(&b, modulus)
-                        } else {
-                            a.modpow(b, modulus)
-                        };
-                        Ok(vm.ctx.new_int(i).into())
-                    },
-                    vm,
-                )
-            }
+        match r#mod.flatten() {
+            Some(modulus) => self.modpow(other, modulus, vm),
             None => self.general_op(other, |a, b| inner_pow(a, b, vm), vm),
         }
     }
@@ -502,20 +536,13 @@ impl PyInt {
         match precision {
             OptionalArg::Missing => (),
             OptionalArg::Present(ref value) => {
-                if !vm.is_none(value) {
-                    // Only accept int type ndigits
-                    let _ndigits = value.payload_if_subclass::<PyInt>(vm).ok_or_else(|| {
-                        vm.new_type_error(format!(
-                            "'{}' object cannot be interpreted as an integer",
-                            value.class().name()
-                        ))
-                    })?;
-                } else {
-                    return Err(vm.new_type_error(format!(
+                // Only accept int type ndigits
+                let _ndigits = value.payload_if_subclass::<PyInt>(vm).ok_or_else(|| {
+                    vm.new_type_error(format!(
                         "'{}' object cannot be interpreted as an integer",
                         value.class().name()
-                    )));
-                }
+                    ))
+                })?;
             }
         }
         Ok(zelf)
@@ -537,18 +564,18 @@ impl PyInt {
     }
 
     #[pymethod(magic)]
-    fn trunc(zelf: PyRef<Self>) -> PyRef<Self> {
-        zelf
+    fn trunc(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyRef<Self> {
+        Self::clone_if_subclass(zelf, vm)
     }
 
     #[pymethod(magic)]
-    fn floor(zelf: PyRef<Self>) -> PyRef<Self> {
-        zelf
+    fn floor(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyRef<Self> {
+        Self::clone_if_subclass(zelf, vm)
     }
 
     #[pymethod(magic)]
-    fn ceil(zelf: PyRef<Self>) -> PyRef<Self> {
-        zelf
+    fn ceil(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyRef<Self> {
+        Self::clone_if_subclass(zelf, vm)
     }
 
     #[pymethod(magic)]
@@ -568,12 +595,9 @@ impl PyInt {
 
     #[pymethod(magic)]
     fn format(&self, spec: PyStrRef, vm: &VirtualMachine) -> PyResult<String> {
-        match FormatSpec::parse(spec.as_str())
+        FormatSpec::parse(spec.as_str())
             .and_then(|format_spec| format_spec.format_int(&self.value))
-        {
-            Ok(string) => Ok(string),
-            Err(err) => Err(vm.new_value_error(err.to_string())),
-        }
+            .map_err(|msg| vm.new_value_error(msg.to_owned()))
     }
 
     #[pymethod(magic)]
@@ -583,7 +607,7 @@ impl PyInt {
 
     #[pymethod(magic)]
     fn sizeof(&self) -> usize {
-        size_of::<Self>() + (((self.value.bits() + 7) & !7) / 8) as usize
+        std::mem::size_of::<Self>() + (((self.value.bits() + 7) & !7) / 8) as usize
     }
 
     #[pymethod]
@@ -597,8 +621,8 @@ impl PyInt {
     }
 
     #[pymethod]
-    fn conjugate(zelf: PyRef<Self>) -> PyRef<Self> {
-        zelf
+    fn conjugate(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyRef<Self> {
+        Self::clone_if_subclass(zelf, vm)
     }
 
     #[pyclassmethod]
@@ -607,21 +631,13 @@ impl PyInt {
         args: IntFromByteArgs,
         vm: &VirtualMachine,
     ) -> PyResult<PyRef<Self>> {
-        let signed = if let OptionalArg::Present(signed) = args.signed {
-            signed.to_bool()
-        } else {
-            false
-        };
-
-        let value = match (args.byteorder.as_str(), signed) {
-            ("big", true) => BigInt::from_signed_bytes_be(&args.bytes.elements),
-            ("big", false) => BigInt::from_bytes_be(Sign::Plus, &args.bytes.elements),
-            ("little", true) => BigInt::from_signed_bytes_le(&args.bytes.elements),
-            ("little", false) => BigInt::from_bytes_le(Sign::Plus, &args.bytes.elements),
-            _ => {
-                return Err(
-                    vm.new_value_error("byteorder must be either 'little' or 'big'".to_owned())
-                )
+        let signed = args.signed.map_or(false, Into::into);
+        let value = match (args.byteorder, signed) {
+            (ArgByteOrder::Big, true) => BigInt::from_signed_bytes_be(&args.bytes.elements),
+            (ArgByteOrder::Big, false) => BigInt::from_bytes_be(Sign::Plus, &args.bytes.elements),
+            (ArgByteOrder::Little, true) => BigInt::from_signed_bytes_le(&args.bytes.elements),
+            (ArgByteOrder::Little, false) => {
+                BigInt::from_bytes_le(Sign::Plus, &args.bytes.elements)
             }
         };
         Self::with_value(cls, value, vm)
@@ -629,29 +645,25 @@ impl PyInt {
 
     #[pymethod]
     fn to_bytes(&self, args: IntToByteArgs, vm: &VirtualMachine) -> PyResult<PyBytes> {
-        let signed = if let OptionalArg::Present(signed) = args.signed {
-            signed.to_bool()
-        } else {
-            false
-        };
-
-        let value = self.as_bigint();
-        if value.sign() == Sign::Minus && !signed {
-            return Err(vm.new_overflow_error("can't convert negative int to unsigned".to_owned()));
-        }
-
+        let signed = args.signed.map_or(false, Into::into);
         let byte_len = args.length.try_to_primitive(vm)?;
 
-        let mut origin_bytes = match (args.byteorder.as_str(), signed) {
-            ("big", true) => value.to_signed_bytes_be(),
-            ("big", false) => value.to_bytes_be().1,
-            ("little", true) => value.to_signed_bytes_le(),
-            ("little", false) => value.to_bytes_le().1,
-            _ => {
+        let value = self.as_bigint();
+        match value.sign() {
+            Sign::Minus if !signed => {
                 return Err(
-                    vm.new_value_error("byteorder must be either 'little' or 'big'".to_owned())
-                );
+                    vm.new_overflow_error("can't convert negative int to unsigned".to_owned())
+                )
             }
+            Sign::NoSign => return Ok(vec![0u8; byte_len].into()),
+            _ => {}
+        }
+
+        let mut origin_bytes = match (args.byteorder, signed) {
+            (ArgByteOrder::Big, true) => value.to_signed_bytes_be(),
+            (ArgByteOrder::Big, false) => value.to_bytes_be().1,
+            (ArgByteOrder::Little, true) => value.to_signed_bytes_le(),
+            (ArgByteOrder::Little, false) => value.to_bytes_le().1,
         };
 
         let origin_len = origin_bytes.len();
@@ -664,38 +676,46 @@ impl PyInt {
             _ => vec![0u8; byte_len - origin_len],
         };
 
-        let bytes = match args.byteorder.as_str() {
-            "big" => {
+        let bytes = match args.byteorder {
+            ArgByteOrder::Big => {
                 let mut bytes = append_bytes;
                 bytes.append(&mut origin_bytes);
                 bytes
             }
-            "little" => {
+            ArgByteOrder::Little => {
                 let mut bytes = origin_bytes;
                 bytes.append(&mut append_bytes);
                 bytes
             }
-            _ => Vec::new(),
         };
         Ok(bytes.into())
     }
-    #[pyproperty]
-    fn real(&self, vm: &VirtualMachine) -> PyRef<Self> {
-        // subclasses must return int here
-        vm.ctx.new_bigint(&self.value)
+
+    #[inline]
+    fn clone_if_subclass(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyRef<Self> {
+        if zelf.class().is(vm.ctx.types.int_type) {
+            return zelf;
+        }
+
+        vm.ctx.new_bigint(&zelf.value)
     }
 
-    #[pyproperty]
+    #[pygetset]
+    fn real(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyRef<Self> {
+        Self::clone_if_subclass(zelf, vm)
+    }
+
+    #[pygetset]
     fn imag(&self) -> usize {
         0
     }
 
-    #[pyproperty]
-    fn numerator(zelf: PyRef<Self>) -> PyRef<Self> {
-        zelf
+    #[pygetset]
+    fn numerator(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyRef<Self> {
+        Self::clone_if_subclass(zelf, vm)
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn denominator(&self) -> usize {
         1
     }
@@ -709,13 +729,13 @@ impl PyInt {
 
     #[pymethod(magic)]
     fn getnewargs(&self, vm: &VirtualMachine) -> PyObjectRef {
-        (self.value.clone(),).into_pyobject(vm)
+        (self.value.clone(),).to_pyobject(vm)
     }
 }
 
 impl Comparable for PyInt {
     fn cmp(
-        zelf: &crate::PyObjectView<Self>,
+        zelf: &crate::Py<Self>,
         other: &PyObject,
         op: PyComparisonOp,
         vm: &VirtualMachine,
@@ -729,8 +749,115 @@ impl Comparable for PyInt {
 
 impl Hashable for PyInt {
     #[inline]
-    fn hash(zelf: &crate::PyObjectView<Self>, _vm: &VirtualMachine) -> PyResult<hash::PyHash> {
+    fn hash(zelf: &crate::Py<Self>, _vm: &VirtualMachine) -> PyResult<hash::PyHash> {
         Ok(hash::hash_bigint(zelf.as_bigint()))
+    }
+}
+
+impl AsNumber for PyInt {
+    fn as_number() -> &'static PyNumberMethods {
+        static AS_NUMBER: PyNumberMethods = PyNumberMethods {
+            add: atomic_func!(|num, other, vm| PyInt::number_int_op(num, other, |a, b| a + b, vm)),
+            subtract: atomic_func!(|num, other, vm| PyInt::number_int_op(
+                num,
+                other,
+                |a, b| a - b,
+                vm
+            )),
+            multiply: atomic_func!(|num, other, vm| PyInt::number_int_op(
+                num,
+                other,
+                |a, b| a * b,
+                vm
+            )),
+            remainder: atomic_func!(|num, other, vm| PyInt::number_general_op(
+                num, other, inner_mod, vm
+            )),
+            divmod: atomic_func!(|num, other, vm| PyInt::number_general_op(
+                num,
+                other,
+                inner_divmod,
+                vm
+            )),
+            power: atomic_func!(|num, other, vm| PyInt::number_general_op(
+                num, other, inner_pow, vm
+            )),
+            negative: atomic_func!(|num, vm| (&PyInt::number_downcast(num).value)
+                .neg()
+                .to_pyresult(vm)),
+            positive: atomic_func!(|num, vm| Ok(PyInt::number_int(num, vm).into())),
+            absolute: atomic_func!(|num, vm| PyInt::number_downcast(num)
+                .value
+                .abs()
+                .to_pyresult(vm)),
+            boolean: atomic_func!(|num, _vm| Ok(PyInt::number_downcast(num).value.is_zero())),
+            invert: atomic_func!(|num, vm| (&PyInt::number_downcast(num).value)
+                .not()
+                .to_pyresult(vm)),
+            lshift: atomic_func!(|num, other, vm| PyInt::number_general_op(
+                num,
+                other,
+                inner_lshift,
+                vm
+            )),
+            rshift: atomic_func!(|num, other, vm| PyInt::number_general_op(
+                num,
+                other,
+                inner_rshift,
+                vm
+            )),
+            and: atomic_func!(|num, other, vm| PyInt::number_int_op(num, other, |a, b| a & b, vm)),
+            xor: atomic_func!(|num, other, vm| PyInt::number_int_op(num, other, |a, b| a ^ b, vm)),
+            or: atomic_func!(|num, other, vm| PyInt::number_int_op(num, other, |a, b| a | b, vm)),
+            int: atomic_func!(|num, other| Ok(PyInt::number_int(num, other))),
+            float: atomic_func!(|num, vm| {
+                let zelf = PyInt::number_downcast(num);
+                try_to_float(&zelf.value, vm).map(|x| vm.ctx.new_float(x))
+            }),
+            floor_divide: atomic_func!(|num, other, vm| {
+                PyInt::number_general_op(num, other, inner_floordiv, vm)
+            }),
+            true_divide: atomic_func!(|num, other, vm| {
+                PyInt::number_general_op(num, other, inner_truediv, vm)
+            }),
+            index: atomic_func!(|num, vm| Ok(PyInt::number_int(num, vm))),
+            ..PyNumberMethods::NOT_IMPLEMENTED
+        };
+        &AS_NUMBER
+    }
+}
+
+impl PyInt {
+    fn number_general_op<F>(
+        number: &PyNumber,
+        other: &PyObject,
+        op: F,
+        vm: &VirtualMachine,
+    ) -> PyResult
+    where
+        F: FnOnce(&BigInt, &BigInt, &VirtualMachine) -> PyResult,
+    {
+        if let (Some(a), Some(b)) = (number.obj.payload::<Self>(), other.payload::<Self>()) {
+            op(&a.value, &b.value, vm)
+        } else {
+            Ok(vm.ctx.not_implemented())
+        }
+    }
+
+    fn number_int_op<F>(number: &PyNumber, other: &PyObject, op: F, vm: &VirtualMachine) -> PyResult
+    where
+        F: FnOnce(&BigInt, &BigInt) -> BigInt,
+    {
+        Self::number_general_op(number, other, |a, b, _vm| op(a, b).to_pyresult(vm), vm)
+    }
+
+    fn number_int(number: &PyNumber, vm: &VirtualMachine) -> PyIntRef {
+        if let Some(zelf) = number.obj.downcast_ref_if_exact::<Self>(vm) {
+            zelf.to_owned()
+        } else {
+            let zelf = Self::number_downcast(number);
+            vm.ctx.new_int(zelf.value.clone())
+        }
     }
 }
 
@@ -745,7 +872,7 @@ pub struct IntOptions {
 #[derive(FromArgs)]
 struct IntFromByteArgs {
     bytes: PyBytesInner,
-    byteorder: PyStrRef,
+    byteorder: ArgByteOrder,
     #[pyarg(named, optional)]
     signed: OptionalArg<ArgIntoBool>,
 }
@@ -753,7 +880,7 @@ struct IntFromByteArgs {
 #[derive(FromArgs)]
 struct IntToByteArgs {
     length: PyIntRef,
-    byteorder: PyStrRef,
+    byteorder: ArgByteOrder,
     #[pyarg(named, optional)]
     signed: OptionalArg<ArgIntoBool>,
 }
@@ -790,7 +917,7 @@ fn try_int_radix(obj: &PyObject, base: u32, vm: &VirtualMachine) -> PyResult<Big
     }
 }
 
-fn bytes_to_int(lit: &[u8], mut base: u32) -> Option<BigInt> {
+pub(crate) fn bytes_to_int(lit: &[u8], mut base: u32) -> Option<BigInt> {
     // split sign
     let mut lit = lit.trim();
     let sign = match lit.first()? {
@@ -862,7 +989,7 @@ fn bytes_to_int(lit: &[u8], mut base: u32) -> Option<BigInt> {
     }
 
     // validate
-    for c in lit.iter() {
+    for c in lit {
         let c = *c;
         if !(c.is_ascii_alphanumeric() || c == b'_') {
             return None;
@@ -909,67 +1036,8 @@ fn i2f(int: &BigInt) -> Option<f64> {
     int.to_f64().filter(|f| f.is_finite())
 }
 
-pub(crate) fn try_int(obj: &PyObject, vm: &VirtualMachine) -> PyResult<BigInt> {
-    fn try_convert(obj: &PyObject, lit: &[u8], vm: &VirtualMachine) -> PyResult<BigInt> {
-        let base = 10;
-        match bytes_to_int(lit, base) {
-            Some(i) => Ok(i),
-            None => Err(vm.new_value_error(format!(
-                "invalid literal for int() with base {}: {}",
-                base,
-                obj.repr(vm)?,
-            ))),
-        }
-    }
-
-    // test for strings and bytes
-    if let Some(s) = obj.downcast_ref::<PyStr>() {
-        return try_convert(obj, s.as_str().as_bytes(), vm);
-    }
-    if let Ok(r) = obj.try_bytes_like(vm, |x| try_convert(obj, x, vm)) {
-        return r;
-    }
-    // strict `int` check
-    if let Some(int) = obj.payload_if_exact::<PyInt>(vm) {
-        return Ok(int.as_bigint().clone());
-    }
-    // call __int__, then __index__, then __trunc__ (converting the __trunc__ result via  __index__ if needed)
-    // TODO: using __int__ is deprecated and removed in Python 3.10
-    if let Some(method) = vm.get_method(obj.to_owned(), "__int__") {
-        let result = vm.invoke(&method?, ())?;
-        return match result.payload::<PyInt>() {
-            Some(int_obj) => Ok(int_obj.as_bigint().clone()),
-            None => Err(vm.new_type_error(format!(
-                "__int__ returned non-int (type '{}')",
-                result.class().name()
-            ))),
-        };
-    }
-    // TODO: returning strict subclasses of int in __index__ is deprecated
-    if let Some(r) = vm.to_index_opt(obj.to_owned()).transpose()? {
-        return Ok(r.as_bigint().clone());
-    }
-    if let Some(method) = vm.get_method(obj.to_owned(), "__trunc__") {
-        let result = vm.invoke(&method?, ())?;
-        return vm
-            .to_index_opt(result.clone())
-            .unwrap_or_else(|| {
-                Err(vm.new_type_error(format!(
-                    "__trunc__ returned non-Integral (type '{}')",
-                    result.class().name()
-                )))
-            })
-            .map(|int_obj| int_obj.as_bigint().clone());
-    }
-
-    Err(vm.new_type_error(format!(
-        "int() argument must be a string, a bytes-like object or a number, not '{}'",
-        obj.class().name()
-    )))
-}
-
-pub(crate) fn init(context: &PyContext) {
-    PyInt::extend_class(context, &context.types.int_type);
+pub(crate) fn init(context: &Context) {
+    PyInt::extend_class(context, context.types.int_type);
 }
 
 #[test]

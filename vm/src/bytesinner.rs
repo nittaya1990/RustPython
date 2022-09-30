@@ -3,14 +3,14 @@ use crate::{
     builtins::{
         pystr, PyByteArray, PyBytes, PyBytesRef, PyInt, PyIntRef, PyStr, PyStrRef, PyTypeRef,
     },
+    byte::bytes_from_object,
     cformat::CFormatBytes,
-    function::ArgIterable,
-    function::{OptionalArg, OptionalOption},
-    sliceable::PySliceableSequence,
+    function::{ArgIterable, Either, OptionalArg, OptionalOption, PyComparisonValue},
+    identifier,
+    protocol::PyBuffer,
+    sequence::{SequenceExt, SequenceMutExt},
     types::PyComparisonOp,
-    utils::Either,
-    IdProtocol, PyComparisonValue, PyObject, PyObjectRef, PyResult, PyValue, TryFromBorrowedObject,
-    VirtualMachine,
+    AsObject, PyObject, PyObjectRef, PyPayload, PyResult, TryFromBorrowedObject, VirtualMachine,
 };
 use bstr::ByteSlice;
 use itertools::Itertools;
@@ -88,7 +88,7 @@ impl ByteInnerNewOptions {
                     obj
                 };
 
-                if let Some(bytes_method) = vm.get_method(obj, "__bytes__") {
+                if let Some(bytes_method) = vm.get_method(obj, identifier!(vm, __bytes__)) {
                     // construct an exact bytes from __bytes__ slot.
                     // if __bytes__ return a bytes, use the bytes object except we are the subclass of the bytes
                     let bytes = vm.invoke(&bytes_method?, ())?;
@@ -190,7 +190,8 @@ impl ByteInnerPaddingOptions {
                 .ok_or_else(|| {
                     vm.new_type_error(format!(
                         "{}() argument 2 must be a byte string of length 1, not {}",
-                        fn_name, &v
+                        fn_name,
+                        v.class().name()
                     ))
                 })?
         } else {
@@ -204,9 +205,9 @@ impl ByteInnerPaddingOptions {
 #[derive(FromArgs)]
 pub struct ByteInnerTranslateOptions {
     #[pyarg(positional)]
-    table: Option<PyBytesInner>,
+    table: Option<PyObjectRef>,
     #[pyarg(any, optional)]
-    delete: OptionalArg<PyBytesInner>,
+    delete: OptionalArg<PyObjectRef>,
 }
 
 impl ByteInnerTranslateOptions {
@@ -214,17 +215,24 @@ impl ByteInnerTranslateOptions {
         let table = self.table.map_or_else(
             || Ok((0..=255).collect::<Vec<u8>>()),
             |v| {
-                if v.elements.len() != 256 {
-                    return Err(vm.new_value_error(
-                        "translation table must be 256 characters long".to_owned(),
-                    ));
-                }
-                Ok(v.elements.to_vec())
+                let bytes = v
+                    .try_into_value::<PyBytesInner>(vm)
+                    .ok()
+                    .filter(|v| v.elements.len() == 256)
+                    .ok_or_else(|| {
+                        vm.new_value_error(
+                            "translation table must be 256 characters long".to_owned(),
+                        )
+                    })?;
+                Ok(bytes.elements.to_vec())
             },
         )?;
 
         let delete = match self.delete {
-            OptionalArg::Present(byte) => byte.elements,
+            OptionalArg::Present(byte) => {
+                let byte: PyBytesInner = byte.try_into_value(vm)?;
+                byte.elements
+            }
             _ => vec![],
         };
 
@@ -292,19 +300,6 @@ impl PyBytesInner {
         })
     }
 
-    pub fn getitem(
-        &self,
-        owner_type: &'static str,
-        needle: PyObjectRef,
-        vm: &VirtualMachine,
-    ) -> PyResult {
-        let obj = match self.elements.get_item(vm, needle, owner_type)? {
-            Either::A(byte) => vm.new_pyobj(byte),
-            Either::B(bytes) => vm.ctx.new_bytes(bytes).into(),
-        };
-        Ok(obj)
-    }
-
     pub fn isalnum(&self) -> bool {
         !self.elements.is_empty()
             && self
@@ -322,7 +317,11 @@ impl PyBytesInner {
     }
 
     pub fn isdigit(&self) -> bool {
-        !self.elements.is_empty() && self.elements.iter().all(|x| char::from(*x).is_digit(10))
+        !self.elements.is_empty()
+            && self
+                .elements
+                .iter()
+                .all(|x| char::from(*x).is_ascii_digit())
     }
 
     pub fn islower(&self) -> bool {
@@ -525,7 +524,16 @@ impl PyBytesInner {
         Ok(self.elements.py_find(&needle, range, find))
     }
 
-    pub fn maketrans(from: PyBytesInner, to: PyBytesInner) -> PyResult<Vec<u8>> {
+    pub fn maketrans(
+        from: PyBytesInner,
+        to: PyBytesInner,
+        vm: &VirtualMachine,
+    ) -> PyResult<Vec<u8>> {
+        if from.len() != to.len() {
+            return Err(
+                vm.new_value_error("the two maketrans arguments must have equal length".to_owned())
+            );
+        }
         let mut res = vec![];
 
         for i in 0..=255 {
@@ -552,7 +560,7 @@ impl PyBytesInner {
             Vec::new()
         };
 
-        for i in self.elements.iter() {
+        for i in &self.elements {
             if !delete.contains(i) {
                 res.push(table[*i as usize]);
             }
@@ -883,7 +891,7 @@ impl PyBytesInner {
         let mut res = vec![];
         let mut spaced = true;
 
-        for i in self.elements.iter() {
+        for i in &self.elements {
             match i {
                 65..=90 | 97..=122 => {
                     if spaced {
@@ -909,8 +917,27 @@ impl PyBytesInner {
             .format(vm, values)
     }
 
-    pub fn repeat(&self, n: usize) -> Vec<u8> {
-        self.elements.repeat(n)
+    pub fn mul(&self, n: isize, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
+        self.elements.mul(vm, n)
+    }
+
+    pub fn imul(&mut self, n: isize, vm: &VirtualMachine) -> PyResult<()> {
+        self.elements.imul(vm, n)
+    }
+
+    pub fn concat(&self, other: &PyObject, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
+        let buffer = PyBuffer::try_from_borrowed_object(vm, other)?;
+        let borrowed = buffer.as_contiguous();
+        if let Some(other) = borrowed {
+            let mut v = Vec::with_capacity(self.elements.len() + other.len());
+            v.extend_from_slice(&self.elements);
+            v.extend_from_slice(&other);
+            Ok(v)
+        } else {
+            let mut v = self.elements.clone();
+            buffer.append_to(&mut v);
+            Ok(v)
+        }
     }
 }
 
@@ -1181,25 +1208,4 @@ pub fn bytes_to_hex(
 
 pub const fn is_py_ascii_whitespace(b: u8) -> bool {
     matches!(b, b'\t' | b'\n' | b'\x0C' | b'\r' | b' ' | b'\x0B')
-}
-
-pub fn bytes_from_object(vm: &VirtualMachine, obj: &PyObject) -> PyResult<Vec<u8>> {
-    if let Ok(elements) = obj.try_bytes_like(vm, |bytes| bytes.to_vec()) {
-        return Ok(elements);
-    }
-
-    if let Ok(elements) = vm.map_iterable_object(obj, |x| value_from_object(vm, &x)) {
-        return elements;
-    }
-
-    Err(vm.new_type_error(
-        "can assign only bytes, buffers, or iterables of ints in range(0, 256)".to_owned(),
-    ))
-}
-
-pub fn value_from_object(vm: &VirtualMachine, obj: &PyObject) -> PyResult<u8> {
-    vm.to_index(obj)?
-        .as_bigint()
-        .to_u8()
-        .ok_or_else(|| vm.new_value_error("byte must be in range(0, 256)".to_owned()))
 }

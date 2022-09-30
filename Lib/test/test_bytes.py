@@ -16,6 +16,8 @@ import textwrap
 import unittest
 
 import test.support
+from test.support import import_helper
+from test.support import warnings_helper
 import test.string_tests
 import test.list_tests
 from test.support import bigaddrspacetest, MAX_Py_ssize_t
@@ -26,7 +28,7 @@ if sys.flags.bytes_warning:
     def check_bytes_warnings(func):
         @functools.wraps(func)
         def wrapper(*args, **kw):
-            with test.support.check_warnings(('', BytesWarning)):
+            with warnings_helper.check_warnings(('', BytesWarning)):
                 return func(*args, **kw)
         return wrapper
 else:
@@ -859,8 +861,6 @@ class BaseBytesTest:
         self.assertEqual([ord(b[i:i+1]) for i in range(len(b))],
                          [0, 65, 127, 128, 255])
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_maketrans(self):
         transtable = b'\000\001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037 !"#$%&\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`xyzdefghijklmnopqrstuvwxyz{|}~\177\200\201\202\203\204\205\206\207\210\211\212\213\214\215\216\217\220\221\222\223\224\225\226\227\230\231\232\233\234\235\236\237\240\241\242\243\244\245\246\247\250\251\252\253\254\255\256\257\260\261\262\263\264\265\266\267\270\271\272\273\274\275\276\277\300\301\302\303\304\305\306\307\310\311\312\313\314\315\316\317\320\321\322\323\324\325\326\327\330\331\332\333\334\335\336\337\340\341\342\343\344\345\346\347\350\351\352\353\354\355\356\357\360\361\362\363\364\365\366\367\370\371\372\373\374\375\376\377'
         self.assertEqual(self.type2test.maketrans(b'abc', b'xyz'), transtable)
@@ -979,7 +979,7 @@ class BaseBytesTest:
         self.assertEqual(c, b'hllo')
 
     def test_sq_item(self):
-        _testcapi = test.support.import_module('_testcapi')
+        _testcapi = import_helper.import_module('_testcapi')
         obj = self.type2test((42,))
         with self.assertRaises(IndexError):
             _testcapi.sequence_getitem(obj, -2)
@@ -1036,8 +1036,8 @@ class BytesTest(BaseBytesTest, unittest.TestCase):
 
     # Test PyBytes_FromFormat()
     def test_from_format(self):
-        ctypes = test.support.import_module('ctypes')
-        _testcapi = test.support.import_module('_testcapi')
+        ctypes = import_helper.import_module('ctypes')
+        _testcapi = import_helper.import_module('_testcapi')
         from ctypes import pythonapi, py_object
         from ctypes import (
             c_int, c_uint,
@@ -1178,6 +1178,28 @@ class BytesTest(BaseBytesTest, unittest.TestCase):
         ba, bb = bytearray(b'ab'), BufferBlocked(b'ab')
         self.assertEqual(bytes(ba), b'ab')
         self.assertRaises(TypeError, bytes, bb)
+
+    def test_repeat_id_preserving(self):
+        a = b'123abc1@'
+        b = b'456zyx-+'
+        self.assertEqual(id(a), id(a))
+        self.assertNotEqual(id(a), id(b))
+        self.assertNotEqual(id(a), id(a * -4))
+        self.assertNotEqual(id(a), id(a * 0))
+        self.assertEqual(id(a), id(a * 1))
+        self.assertEqual(id(a), id(1 * a))
+        self.assertNotEqual(id(a), id(a * 2))
+
+        class SubBytes(bytes):
+            pass
+
+        s = SubBytes(b'qwerty()')
+        self.assertEqual(id(s), id(s))
+        self.assertNotEqual(id(s), id(s * -4))
+        self.assertNotEqual(id(s), id(s * 0))
+        self.assertNotEqual(id(s), id(s * 1))
+        self.assertNotEqual(id(s), id(1 * s))
+        self.assertNotEqual(id(s), id(s * 2))
 
 
 class ByteArrayTest(BaseBytesTest, unittest.TestCase):
@@ -1639,8 +1661,6 @@ class ByteArrayTest(BaseBytesTest, unittest.TestCase):
         from _testcapi import getbuffer_with_null_view
         self.assertRaises(BufferError, getbuffer_with_null_view, bytearray())
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_iterator_pickling2(self):
         orig = bytearray(b'abc')
         data = list(b'qwerty')
@@ -1753,8 +1773,6 @@ class AssortedBytesTest(unittest.TestCase):
         self.assertEqual(bytes(b"abc") < b"ab", False)
         self.assertEqual(bytes(b"abc") <= b"ab", False)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     @test.support.requires_docstrings
     def test_doc(self):
         self.assertIsNotNone(bytearray.__doc__)
@@ -1805,7 +1823,7 @@ class AssortedBytesTest(unittest.TestCase):
                          "BytesWarning is needed for this test: use -bb option")
     def test_compare(self):
         def bytes_warning():
-            return test.support.check_warnings(('', BytesWarning))
+            return warnings_helper.check_warnings(('', BytesWarning))
         with bytes_warning():
             b'' == ''
         with bytes_warning():

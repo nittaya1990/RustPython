@@ -2,12 +2,13 @@
  * iterator types
  */
 
-use super::{PyInt, PyTupleRef, PyTypeRef};
+use super::{PyInt, PyTupleRef, PyType};
 use crate::{
+    class::PyClassImpl,
     function::ArgCallable,
-    protocol::PyIterReturn,
+    protocol::{PyIterReturn, PySequence, PySequenceMethods},
     types::{IterNext, IterNextIterable},
-    ItemProtocol, PyClassImpl, PyContext, PyObject, PyObjectRef, PyResult, PyValue, VirtualMachine,
+    Context, Py, PyObject, PyObjectRef, PyPayload, PyResult, VirtualMachine,
 };
 use rustpython_common::{
     lock::{PyMutex, PyRwLock, PyRwLockUpgradableReadGuard},
@@ -147,45 +148,50 @@ pub fn builtins_iter(vm: &VirtualMachine) -> &PyObject {
     static_cell! {
         static INSTANCE: PyObjectRef;
     }
-    INSTANCE.get_or_init(|| vm.builtins.clone().get_attr("iter", vm).unwrap())
+    INSTANCE.get_or_init(|| vm.builtins.get_attr("iter", vm).unwrap())
 }
 
 pub fn builtins_reversed(vm: &VirtualMachine) -> &PyObject {
     static_cell! {
         static INSTANCE: PyObjectRef;
     }
-    INSTANCE.get_or_init(|| vm.builtins.clone().get_attr("reversed", vm).unwrap())
+    INSTANCE.get_or_init(|| vm.builtins.get_attr("reversed", vm).unwrap())
 }
 
 #[pyclass(module = false, name = "iterator")]
 #[derive(Debug)]
 pub struct PySequenceIterator {
+    // cached sequence methods
+    seq_methods: &'static PySequenceMethods,
     internal: PyMutex<PositionIterInternal<PyObjectRef>>,
 }
 
-impl PyValue for PySequenceIterator {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.iter_type
+impl PyPayload for PySequenceIterator {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.iter_type
     }
 }
 
-#[pyimpl(with(IterNext))]
+#[pyclass(with(IterNext))]
 impl PySequenceIterator {
-    pub fn new(obj: PyObjectRef) -> Self {
-        Self {
+    pub fn new(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<Self> {
+        let seq = PySequence::try_protocol(obj.as_ref(), vm)?;
+        Ok(Self {
+            seq_methods: seq.methods,
             internal: PyMutex::new(PositionIterInternal::new(obj, 0)),
-        }
+        })
     }
 
     #[pymethod(magic)]
     fn length_hint(&self, vm: &VirtualMachine) -> PyObjectRef {
         let internal = self.internal.lock();
         if let IterStatus::Active(obj) = &internal.status {
-            obj.length(vm)
-                .map(|x| PyInt::from(x).into_object(vm))
+            let seq = PySequence::with_methods(obj, self.seq_methods);
+            seq.length(vm)
+                .map(|x| PyInt::from(x).into_pyobject(vm))
                 .unwrap_or_else(|_| vm.ctx.not_implemented())
         } else {
-            PyInt::from(0).into_object(vm)
+            PyInt::from(0).into_pyobject(vm)
         }
     }
 
@@ -202,10 +208,11 @@ impl PySequenceIterator {
 
 impl IterNextIterable for PySequenceIterator {}
 impl IterNext for PySequenceIterator {
-    fn next(zelf: &crate::PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
-        zelf.internal
-            .lock()
-            .next(|obj, pos| PyIterReturn::from_getitem_result(obj.get_item(pos, vm), vm))
+    fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+        zelf.internal.lock().next(|obj, pos| {
+            let seq = PySequence::with_methods(obj, zelf.seq_methods);
+            PyIterReturn::from_getitem_result(seq.get_item(pos as isize, vm), vm)
+        })
     }
 }
 
@@ -216,13 +223,13 @@ pub struct PyCallableIterator {
     status: PyRwLock<IterStatus<ArgCallable>>,
 }
 
-impl PyValue for PyCallableIterator {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.callable_iterator
+impl PyPayload for PyCallableIterator {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.callable_iterator
     }
 }
 
-#[pyimpl(with(IterNext))]
+#[pyclass(with(IterNext))]
 impl PyCallableIterator {
     pub fn new(callable: ArgCallable, sentinel: PyObjectRef) -> Self {
         Self {
@@ -234,7 +241,7 @@ impl PyCallableIterator {
 
 impl IterNextIterable for PyCallableIterator {}
 impl IterNext for PyCallableIterator {
-    fn next(zelf: &crate::PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+    fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         let status = zelf.status.upgradable_read();
         let next = if let IterStatus::Active(callable) = &*status {
             let ret = callable.invoke((), vm)?;
@@ -251,7 +258,7 @@ impl IterNext for PyCallableIterator {
     }
 }
 
-pub fn init(context: &PyContext) {
-    PySequenceIterator::extend_class(context, &context.types.iter_type);
-    PyCallableIterator::extend_class(context, &context.types.callable_iterator);
+pub fn init(context: &Context) {
+    PySequenceIterator::extend_class(context, context.types.iter_type);
+    PyCallableIterator::extend_class(context, context.types.callable_iterator);
 }

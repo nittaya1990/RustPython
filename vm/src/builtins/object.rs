@@ -1,9 +1,10 @@
 use super::{PyDict, PyDictRef, PyList, PyStr, PyStrRef, PyType, PyTypeRef};
 use crate::common::hash::PyHash;
 use crate::{
-    function::FuncArgs, types::PyComparisonOp, utils::Either, IdProtocol, ItemProtocol,
-    PyArithmeticValue, PyAttributes, PyClassImpl, PyComparisonValue, PyContext, PyGenericObject,
-    PyObject, PyObjectRef, PyResult, PyValue, TypeProtocol, VirtualMachine,
+    class::PyClassImpl,
+    function::{Either, FuncArgs, PyArithmeticValue, PyComparisonValue, PySetterValue},
+    types::PyComparisonOp,
+    AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyResult, VirtualMachine,
 };
 
 /// object()
@@ -17,24 +18,36 @@ use crate::{
 #[derive(Debug)]
 pub struct PyBaseObject;
 
-impl PyValue for PyBaseObject {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.object_type
+impl PyPayload for PyBaseObject {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.object_type
     }
 }
 
-#[pyimpl(flags(BASETYPE))]
+#[pyclass(flags(BASETYPE))]
 impl PyBaseObject {
     /// Create and return a new object.  See help(type) for accurate signature.
     #[pyslot]
     fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         // more or less __new__ operator
-        let dict = if cls.is(&vm.ctx.types.object_type) {
+        let dict = if cls.is(vm.ctx.types.object_type) {
             None
         } else {
             Some(vm.ctx.new_dict())
         };
-        Ok(PyGenericObject::new(PyBaseObject, cls, dict))
+
+        // Ensure that all abstract methods are implemented before instantiating instance.
+        if let Some(abs_methods) = cls.get_attr(identifier!(vm, __abstractmethods__)) {
+            if let Some(unimplemented_abstract_method_count) = abs_methods.length_opt(vm) {
+                if unimplemented_abstract_method_count? > 0 {
+                    return Err(
+                        vm.new_type_error("You must implement the abstract methods".to_owned())
+                    );
+                }
+            }
+        }
+
+        Ok(crate::PyRef::new_ref(PyBaseObject, cls, dict).into())
     }
 
     #[pyslot]
@@ -148,23 +161,23 @@ impl PyBaseObject {
         value: PyObjectRef,
         vm: &VirtualMachine,
     ) -> PyResult<()> {
-        setattr(&obj, name, Some(value), vm)
+        obj.generic_setattr(name, PySetterValue::Assign(value), vm)
     }
 
     /// Implement delattr(self, name).
     #[pymethod]
     fn __delattr__(obj: PyObjectRef, name: PyStrRef, vm: &VirtualMachine) -> PyResult<()> {
-        setattr(&obj, name, None, vm)
+        obj.generic_setattr(name, PySetterValue::Delete, vm)
     }
 
     #[pyslot]
     fn slot_setattro(
         obj: &PyObject,
         attr_name: PyStrRef,
-        value: Option<PyObjectRef>,
+        value: PySetterValue,
         vm: &VirtualMachine,
     ) -> PyResult<()> {
-        setattr(&*obj, attr_name, value, vm)
+        obj.generic_setattr(attr_name, value, vm)
     }
 
     /// Return str(self).
@@ -210,13 +223,17 @@ impl PyBaseObject {
 
     #[pymethod(magic)]
     pub fn dir(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyList> {
-        let attributes: PyAttributes = obj.class().get_attributes();
+        let attributes = obj.class().get_attributes();
 
         let dict = PyDict::from_attributes(attributes, vm)?.into_ref(vm);
 
         // Get instance attributes:
         if let Some(object_dict) = obj.dict() {
-            vm.call_method(dict.as_object(), "update", (object_dict,))?;
+            vm.call_method(
+                dict.as_object(),
+                identifier!(vm, update).as_str(),
+                (object_dict,),
+            )?;
         }
 
         let attributes: Vec<_> = dict.into_iter().map(|(k, _v)| k).collect();
@@ -236,15 +253,18 @@ impl PyBaseObject {
         }
     }
 
+    #[pyslot]
     #[pymethod(magic)]
-    fn init(_args: FuncArgs) {}
-
-    #[pyproperty(name = "__class__")]
-    fn get_class(obj: PyObjectRef) -> PyTypeRef {
-        obj.clone_class()
+    fn init(_zelf: PyObjectRef, _args: FuncArgs, _vm: &VirtualMachine) -> PyResult<()> {
+        Ok(())
     }
 
-    #[pyproperty(name = "__class__", setter)]
+    #[pygetset(name = "__class__")]
+    fn get_class(obj: PyObjectRef) -> PyTypeRef {
+        obj.class().clone()
+    }
+
+    #[pygetset(name = "__class__", setter)]
     fn set_class(instance: PyObjectRef, value: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
         if instance.payload_is::<PyBaseObject>() {
             match value.downcast::<PyType>() {
@@ -270,11 +290,15 @@ impl PyBaseObject {
     }
 
     /// Return getattr(self, name).
-    #[pymethod(name = "__getattribute__")]
     #[pyslot]
-    pub(crate) fn getattro(obj: PyObjectRef, name: PyStrRef, vm: &VirtualMachine) -> PyResult {
+    pub(crate) fn getattro(obj: &PyObject, name: PyStrRef, vm: &VirtualMachine) -> PyResult {
         vm_trace!("object.__getattribute__({:?}, {:?})", obj, name);
-        vm.generic_getattribute(obj, name)
+        obj.as_object().generic_getattr(name, vm)
+    }
+
+    #[pymethod(magic)]
+    fn getattribute(obj: PyObjectRef, name: PyStrRef, vm: &VirtualMachine) -> PyResult {
+        Self::getattro(&obj, name, vm)
     }
 
     #[pymethod(magic)]
@@ -284,10 +308,11 @@ impl PyBaseObject {
 
     #[pymethod(magic)]
     fn reduce_ex(obj: PyObjectRef, proto: usize, vm: &VirtualMachine) -> PyResult {
-        if let Some(reduce) = vm.get_attribute_opt(obj.clone(), "__reduce__")? {
-            let object_reduce = vm.ctx.types.object_type.get_attr("__reduce__").unwrap();
-            let typ_obj: PyObjectRef = obj.clone_class().into();
-            let class_reduce = typ_obj.get_attr("__reduce__", vm)?;
+        let __reduce__ = identifier!(vm, __reduce__);
+        if let Some(reduce) = vm.get_attribute_opt(obj.clone(), __reduce__)? {
+            let object_reduce = vm.ctx.types.object_type.get_attr(__reduce__).unwrap();
+            let typ_obj: PyObjectRef = obj.class().clone().into();
+            let class_reduce = typ_obj.get_attr(__reduce__, vm)?;
             if !class_reduce.is(&object_reduce) {
                 return vm.invoke(&reduce, ());
             }
@@ -305,6 +330,11 @@ impl PyBaseObject {
     fn hash(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyHash> {
         Self::slot_hash(&zelf, vm)
     }
+
+    #[pymethod(magic)]
+    fn sizeof(zelf: PyObjectRef) -> usize {
+        zelf.class().slots.basicsize
+    }
 }
 
 pub fn object_get_dict(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyDictRef> {
@@ -316,50 +346,8 @@ pub fn object_set_dict(obj: PyObjectRef, dict: PyDictRef, vm: &VirtualMachine) -
         .map_err(|_| vm.new_attribute_error("This object has no __dict__".to_owned()))
 }
 
-#[cfg_attr(feature = "flame-it", flame)]
-pub(crate) fn setattr(
-    obj: &PyObject,
-    attr_name: PyStrRef,
-    value: Option<PyObjectRef>,
-    vm: &VirtualMachine,
-) -> PyResult<()> {
-    vm_trace!("object.__setattr__({:?}, {}, {:?})", obj, attr_name, value);
-
-    if let Some(attr) = obj.get_class_attr(attr_name.as_str()) {
-        let descr_set = attr.class().mro_find_map(|cls| cls.slots.descr_set.load());
-        if let Some(descriptor) = descr_set {
-            return descriptor(attr, obj.to_owned(), value, vm);
-        }
-    }
-
-    if let Some(dict) = obj.dict() {
-        if let Some(value) = value {
-            dict.set_item(attr_name, value, vm)?;
-        } else {
-            dict.del_item(attr_name.clone(), vm).map_err(|e| {
-                if e.isinstance(&vm.ctx.exceptions.key_error) {
-                    vm.new_attribute_error(format!(
-                        "'{}' object has no attribute '{}'",
-                        obj.class().name(),
-                        attr_name,
-                    ))
-                } else {
-                    e
-                }
-            })?;
-        }
-        Ok(())
-    } else {
-        Err(vm.new_attribute_error(format!(
-            "'{}' object has no attribute '{}'",
-            obj.class().name(),
-            attr_name,
-        )))
-    }
-}
-
-pub fn init(ctx: &PyContext) {
-    PyBaseObject::extend_class(ctx, &ctx.types.object_type);
+pub fn init(ctx: &Context) {
+    PyBaseObject::extend_class(ctx, ctx.types.object_type);
 }
 
 fn common_reduce(obj: PyObjectRef, proto: usize, vm: &VirtualMachine) -> PyResult {

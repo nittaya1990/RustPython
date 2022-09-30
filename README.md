@@ -2,7 +2,7 @@
 
 # [RustPython](https://rustpython.github.io/)
 
-A Python-3 (CPython >= 3.9.0) Interpreter written in Rust :snake: :scream:
+A Python-3 (CPython >= 3.10.0) Interpreter written in Rust :snake: :scream:
 :metal:.
 
 [![Build Status](https://github.com/RustPython/RustPython/workflows/CI/badge.svg)](https://github.com/RustPython/RustPython/actions?query=workflow%3ACI)
@@ -74,6 +74,17 @@ this isn't officially supported and may be out of date:
 
 You can compile RustPython to a standalone WebAssembly WASI module so it can run anywhere.
 
+Build
+```shell
+$ cargo build --target wasm32-wasi --no-default-features --features freeze-stdlib,stdlib --release
+```
+
+Run by wasmer
+```shell
+$ wasmer run --dir . target/wasm32-wasi/release/rustpython.wasm extra_tests/snippets/stdlib_random.py
+```
+
+Run by wapm
 ```shell
 $ wapm install rustpython
 $ wapm run rustpython
@@ -157,7 +168,7 @@ make cool projects:
 Currently along with other areas of the project, documentation is still in an
 early phase.
 
-You can read the [online documentation](https://docs.rs/rustpython-vm) for the
+You can read the [online documentation](https://docs.rs/rustpython) for the
 latest release, or the [user guide](https://rustpython.github.io/docs/).
 
 You can also generate documentation locally by running:
@@ -187,7 +198,7 @@ To enhance CPython compatibility, try to increase unittest coverage by checking 
 Another approach is to checkout the source code: builtin functions and object
 methods are often the simplest and easiest way to contribute.
 
-You can also simply run `./whats_left.sh` to assist in finding any unimplemented
+You can also simply run `./whats_left.py` to assist in finding any unimplemented
 method.
 
 ## Compiling to WebAssembly

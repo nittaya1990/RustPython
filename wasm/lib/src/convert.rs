@@ -4,11 +4,10 @@ use js_sys::{Array, ArrayBuffer, Object, Promise, Reflect, SyntaxError, Uint8Arr
 use rustpython_parser::error::ParseErrorType;
 use rustpython_vm::{
     builtins::PyBaseExceptionRef,
-    compile::{CompileError, CompileErrorType},
+    compiler::{CompileError, CompileErrorType},
     exceptions,
     function::{ArgBytesLike, FuncArgs},
-    py_serde, ItemProtocol, PyObjectRef, PyResult, PyValue, TryFromBorrowedObject, TypeProtocol,
-    VirtualMachine,
+    py_serde, AsObject, PyObjectRef, PyPayload, PyResult, TryFromBorrowedObject, VirtualMachine,
 };
 use wasm_bindgen::{closure::Closure, prelude::*, JsCast};
 
@@ -33,7 +32,7 @@ extern "C" {
 
 pub fn py_err_to_js_err(vm: &VirtualMachine, py_err: &PyBaseExceptionRef) -> JsValue {
     let jserr = vm.try_class("_js", "JSError").ok();
-    let js_arg = if jserr.map_or(false, |jserr| py_err.isinstance(&jserr)) {
+    let js_arg = if jserr.map_or(false, |jserr| py_err.fast_isinstance(&jserr)) {
         py_err.get_arg(0)
     } else {
         None
@@ -63,16 +62,16 @@ pub fn js_err_to_py_err(vm: &VirtualMachine, js_err: &JsValue) -> PyBaseExceptio
     match js_err.dyn_ref::<js_sys::Error>() {
         Some(err) => {
             let exc_type = match String::from(err.name()).as_str() {
-                "TypeError" => &vm.ctx.exceptions.type_error,
-                "ReferenceError" => &vm.ctx.exceptions.name_error,
-                "SyntaxError" => &vm.ctx.exceptions.syntax_error,
-                _ => &vm.ctx.exceptions.exception_type,
+                "TypeError" => vm.ctx.exceptions.type_error,
+                "ReferenceError" => vm.ctx.exceptions.name_error,
+                "SyntaxError" => vm.ctx.exceptions.syntax_error,
+                _ => vm.ctx.exceptions.exception_type,
             }
-            .clone();
+            .to_owned();
             vm.new_exception_msg(exc_type, err.message().into())
         }
         None => vm.new_exception_msg(
-            vm.ctx.exceptions.exception_type.clone(),
+            vm.ctx.exceptions.exception_type.to_owned(),
             format!("{:?}", js_err),
         ),
     }
@@ -80,11 +79,11 @@ pub fn js_err_to_py_err(vm: &VirtualMachine, js_err: &JsValue) -> PyBaseExceptio
 
 pub fn py_to_js(vm: &VirtualMachine, py_obj: PyObjectRef) -> JsValue {
     if let Some(ref wasm_id) = vm.wasm_id {
-        if py_obj.isinstance(&vm.ctx.types.function_type) {
+        if py_obj.fast_isinstance(vm.ctx.types.function_type) {
             let wasm_vm = WASMVirtualMachine {
                 id: wasm_id.clone(),
             };
-            let weak_py_obj = wasm_vm.push_held_rc(py_obj).unwrap();
+            let weak_py_obj = wasm_vm.push_held_rc(py_obj).unwrap().unwrap();
 
             let closure = move |args: Option<Box<[JsValue]>>,
                                 kwargs: Option<Object>|

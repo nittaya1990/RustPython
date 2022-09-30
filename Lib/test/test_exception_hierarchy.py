@@ -45,8 +45,6 @@ class HierarchyTest(unittest.TestCase):
         self.assertIs(socket.herror.__base__, OSError)
         self.assertIs(socket.timeout.__base__, OSError)
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_select_error(self):
         self.assertIs(select.error, OSError)
 
@@ -95,6 +93,11 @@ class HierarchyTest(unittest.TestCase):
             e = OSError(errcode, "Some message")
             self.assertIs(type(e), OSError)
 
+    # TODO: RUSTPYTHON
+    import sys
+    if sys.platform == 'win32':
+        test_errno_mapping = unittest.expectedFailure(test_errno_mapping)
+
     def test_try_except(self):
         filename = "some_hopefully_non_existing_file"
 
@@ -138,6 +141,8 @@ class AttributesTest(unittest.TestCase):
         if os.name == "nt":
             self.assertEqual(e.winerror, None)
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     @unittest.skipUnless(os.name == "nt", "Windows-specific test")
     def test_errno_translation(self):
         # ERROR_ALREADY_EXISTS (183) -> EEXIST

@@ -10,8 +10,9 @@ mod re {
      */
     use crate::vm::{
         builtins::{PyInt, PyIntRef, PyStr, PyStrRef},
-        function::{IntoPyObject, OptionalArg, PosArgs},
-        match_class, PyObjectRef, PyResult, PyValue, TryFromObject, VirtualMachine,
+        convert::{ToPyObject, TryFromObject},
+        function::{OptionalArg, PosArgs},
+        match_class, PyObjectRef, PyResult, PyPayload, VirtualMachine,
     };
     use num_traits::Signed;
     use regex::bytes::{Captures, Regex, RegexBuilder};
@@ -20,7 +21,7 @@ mod re {
 
     #[pyattr]
     #[pyclass(module = "re", name = "Pattern")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct PyPattern {
         regex: Regex,
         pattern: String,
@@ -76,7 +77,7 @@ mod re {
     /// Inner data for a match object.
     #[pyattr]
     #[pyclass(module = "re", name = "Match")]
-    #[derive(PyValue)]
+    #[derive(PyPayload)]
     struct PyMatch {
         haystack: PyStrRef,
         captures: Vec<Option<Range<usize>>>,
@@ -252,9 +253,11 @@ mod re {
         let split = output
             .into_iter()
             .map(|v| {
-                vm.unwrap_or_none(
-                    v.map(|v| vm.ctx.new_str(String::from_utf8_lossy(v).into_owned()).into()),
-                )
+                vm.unwrap_or_none(v.map(|v| {
+                    vm.ctx
+                        .new_str(String::from_utf8_lossy(v).into_owned())
+                        .into()
+                }))
             })
             .collect();
         Ok(vm.ctx.new_list(split).into())
@@ -293,10 +296,7 @@ mod re {
     }
 
     fn extract_flags(flags: OptionalArg<usize>) -> PyRegexFlags {
-        match flags {
-            OptionalArg::Present(flags) => PyRegexFlags::from_int(flags),
-            OptionalArg::Missing => Default::default(),
-        }
+        flags.map_or_else(Default::default, PyRegexFlags::from_int)
     }
 
     #[pyfunction]
@@ -317,7 +317,7 @@ mod re {
     #[pyfunction]
     fn purge(_vm: &VirtualMachine) {}
 
-    #[pyimpl]
+    #[pyclass]
     impl PyPattern {
         #[pymethod(name = "match")]
         fn match_(&self, text: PyStrRef) -> Option<PyMatch> {
@@ -343,7 +343,7 @@ mod re {
             self.sub(repl, text, vm)
         }
 
-        #[pyproperty]
+        #[pygetset]
         fn pattern(&self, vm: &VirtualMachine) -> PyResult<PyStrRef> {
             Ok(vm.ctx.new_str(self.pattern.clone()))
         }
@@ -364,23 +364,25 @@ mod re {
         }
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl PyMatch {
         #[pymethod]
         fn start(&self, group: OptionalArg, vm: &VirtualMachine) -> PyResult {
             let group = group.unwrap_or_else(|| vm.ctx.new_int(0).into());
-            let start = self
-                .get_bounds(group, vm)?
-                .map_or_else(|| vm.ctx.new_int(-1).into(), |r| vm.ctx.new_int(r.start).into());
+            let start = self.get_bounds(group, vm)?.map_or_else(
+                || vm.ctx.new_int(-1).into(),
+                |r| vm.ctx.new_int(r.start).into(),
+            );
             Ok(start)
         }
 
         #[pymethod]
         fn end(&self, group: OptionalArg, vm: &VirtualMachine) -> PyResult {
             let group = group.unwrap_or_else(|| vm.ctx.new_int(0).into());
-            let end = self
-                .get_bounds(group, vm)?
-                .map_or_else(|| vm.ctx.new_int(-1).into(), |r| vm.ctx.new_int(r.end).into());
+            let end = self.get_bounds(group, vm)?.map_or_else(
+                || vm.ctx.new_int(-1).into(),
+                |r| vm.ctx.new_int(r.end).into(),
+            );
             Ok(end)
         }
 
@@ -418,14 +420,14 @@ mod re {
             match groups.len() {
                 0 => Ok(self
                     .subgroup(self.captures[0].clone().unwrap())
-                    .into_pyobject(vm)),
+                    .to_pyobject(vm)),
                 1 => self
                     .get_group(groups.pop().unwrap(), vm)
-                    .map(|g| g.into_pyobject(vm)),
+                    .map(|g| g.to_pyobject(vm)),
                 _ => {
                     let output: Result<Vec<_>, _> = groups
                         .into_iter()
-                        .map(|id| self.get_group(id, vm).map(|g| g.into_pyobject(vm)))
+                        .map(|id| self.get_group(id, vm).map(|g| g.to_pyobject(vm)))
                         .collect();
                     Ok(vm.ctx.new_tuple(output?)).into()
                 }
@@ -442,7 +444,7 @@ mod re {
                     vm.unwrap_or_none(
                         capture
                             .as_ref()
-                            .map(|bounds| self.subgroup(bounds.clone()).into_pyobject(vm))
+                            .map(|bounds| self.subgroup(bounds.clone()).to_pyobject(vm))
                             .or_else(|| default.clone()),
                     )
                 })

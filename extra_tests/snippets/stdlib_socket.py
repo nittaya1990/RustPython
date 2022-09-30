@@ -1,6 +1,9 @@
+import _socket
 import socket
 import os
 from testutils import assert_raises
+
+assert _socket.socket == _socket.SocketType
 
 MESSAGE_A = b'aaaa'
 MESSAGE_B= b'bbbbb'
@@ -160,7 +163,9 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
 for exc, expected_name in [
     (socket.gaierror, "gaierror"),
     (socket.herror, "herror"),
-    (socket.timeout, "timeout"),
 ]:
     assert exc.__module__ == "socket"
     assert exc.__name__ == expected_name
+
+# assert socket.timeout.__module__ == "builtins"
+# assert socket.timeout.__name__ == "TimeoutError"

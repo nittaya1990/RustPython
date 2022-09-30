@@ -8,9 +8,11 @@ mod _browser {
     use js_sys::Promise;
     use rustpython_vm::{
         builtins::{PyDictRef, PyStrRef},
-        function::{ArgCallable, IntoPyObject, OptionalArg},
+        class::PyClassImpl,
+        convert::ToPyObject,
+        function::{ArgCallable, OptionalArg},
         import::import_file,
-        PyClassImpl, PyGenericObject, PyObjectRef, PyResult, PyValue, VirtualMachine,
+        PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
     };
     use wasm_bindgen::{prelude::*, JsCast};
     use wasm_bindgen_futures::JsFuture;
@@ -110,7 +112,7 @@ mod _browser {
             JsFuture::from(response_format.get_response(&response)?).await
         };
 
-        Ok(PyPromise::from_future(future).into_object(vm))
+        Ok(PyPromise::from_future(future).into_pyobject(vm))
     }
 
     #[pyfunction]
@@ -159,12 +161,12 @@ mod _browser {
 
     #[pyattr]
     #[pyclass(module = "browser", name)]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct Document {
         doc: web_sys::Document,
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl Document {
         #[pymethod]
         fn query(&self, query: PyStrRef, vm: &VirtualMachine) -> PyResult {
@@ -173,14 +175,14 @@ mod _browser {
                 .query_selector(query.as_str())
                 .map_err(|err| convert::js_py_typeerror(vm, err))?
                 .map(|elem| Element { elem })
-                .into_pyobject(vm);
+                .to_pyobject(vm);
             Ok(elem)
         }
     }
 
     #[pyattr]
-    fn document(vm: &VirtualMachine) -> PyObjectRef {
-        PyGenericObject::new(
+    fn document(vm: &VirtualMachine) -> PyRef<Document> {
+        PyRef::new_ref(
             Document {
                 doc: window().document().expect("Document missing from window"),
             },
@@ -191,12 +193,12 @@ mod _browser {
 
     #[pyattr]
     #[pyclass(module = "browser", name)]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct Element {
         elem: web_sys::Element,
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl Element {
         #[pymethod]
         fn get_attr(
@@ -251,7 +253,7 @@ mod _browser {
             })
         };
 
-        Ok(PyPromise::from_future(future).into_object(vm))
+        Ok(PyPromise::from_future(future).into_pyobject(vm))
     }
 }
 

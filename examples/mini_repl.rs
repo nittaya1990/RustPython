@@ -6,8 +6,6 @@
 use rustpython_vm as vm;
 // these are needed for special memory shenanigans to let us share a variable with Python and Rust
 use std::sync::atomic::{AtomicBool, Ordering};
-// this needs to be in scope in order to insert things into scope.globals
-use vm::ItemProtocol;
 
 // This has to be a macro because it uses the py_compile macro,
 // which compiles python source to optimized bytecode at compile time, so that
@@ -16,8 +14,8 @@ macro_rules! add_python_function {
     ( $scope:ident, $vm:ident, $src:literal $(,)? ) => {{
         // compile the code to bytecode
         let code = vm::py_compile!(source = $src);
-        // convert the rustpython_bytecode::CodeObject to a PyRef<PyCode>
-        let code = $vm.new_code_object(code);
+        // convert the rustpython_compiler_core::CodeObject to a PyRef<PyCode>
+        let code = $vm.ctx.new_code(code);
 
         // run the python code in the scope to store the function
         $vm.run_code_obj(code, $scope.clone())
@@ -31,7 +29,7 @@ fn on(b: bool) {
 }
 
 fn main() -> vm::PyResult<()> {
-    vm::Interpreter::default().enter(run)
+    vm::Interpreter::without_stdlib(Default::default()).enter(run)
 }
 
 fn run(vm: &vm::VirtualMachine) -> vm::PyResult<()> {
@@ -64,9 +62,9 @@ def fib(n):
             .expect("Failed to read line of input");
 
         // this line also automatically prints the output
-        // (note that this is only the case when compile::Mode::Single is passed to vm.compile)
+        // (note that this is only the case when compiler::Mode::Single is passed to vm.compile)
         match vm
-            .compile(&input, vm::compile::Mode::Single, "<embedded>".to_owned())
+            .compile(&input, vm::compiler::Mode::Single, "<embedded>".to_owned())
             .map_err(|err| vm.new_syntax_error(&err))
             .and_then(|code_obj| vm.run_code_obj(code_obj, scope.clone()))
         {

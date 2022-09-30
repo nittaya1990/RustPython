@@ -4,8 +4,9 @@ pub use msvcrt::*;
 mod msvcrt {
     use crate::{
         builtins::{PyBytes, PyStrRef},
+        common::suppress_iph,
         stdlib::os::errno_err,
-        suppress_iph, PyRef, PyResult, VirtualMachine,
+        PyRef, PyResult, VirtualMachine,
     };
     use itertools::Itertools;
     use winapi::{
@@ -21,16 +22,6 @@ mod msvcrt {
 
     pub fn setmode_binary(fd: i32) {
         unsafe { suppress_iph!(_setmode(fd, libc::O_BINARY)) };
-    }
-
-    pub fn get_errno() -> i32 {
-        let mut e = 0;
-        unsafe { suppress_iph!(_get_errno(&mut e)) };
-        e
-    }
-
-    extern "C" {
-        fn _get_errno(pValue: *mut i32) -> i32;
     }
 
     extern "C" {

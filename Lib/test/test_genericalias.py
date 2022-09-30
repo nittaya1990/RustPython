@@ -10,17 +10,17 @@ from collections.abc import *
 from concurrent.futures import Future
 from concurrent.futures.thread import _WorkItem
 from contextlib import AbstractContextManager, AbstractAsyncContextManager
-# XXX RUSTPYTHON TODO: from contextvars import ContextVar, Token
+from contextvars import ContextVar, Token
 from dataclasses import Field
 from functools import partial, partialmethod, cached_property
-# XXX RUSTPYTHON TODO: from mailbox import Mailbox, _PartialFile
+from mailbox import Mailbox, _PartialFile
 try:
     import ctypes
 except ImportError:
     ctypes = None
 from difflib import SequenceMatcher
-# XXX RUSTPYTHON TODO: from filecmp import dircmp
-# XXX RUSTPYTHON TODO: from fileinput import FileInput
+from filecmp import dircmp
+from fileinput import FileInput
 from itertools import chain
 from http.cookies import Morsel
 from multiprocessing.managers import ValueProxy
@@ -51,20 +51,20 @@ class BaseTest(unittest.TestCase):
     generic_types = [type, tuple, list, dict, set, frozenset, enumerate,
                      defaultdict, deque,
                      SequenceMatcher,
-                     # XXX RUSTPYTHON TODO: dircmp,
-                     # XXX RUSTPYTHON TODO: FileInput,
+                     dircmp,
+                     FileInput,
                      OrderedDict, Counter, UserDict, UserList,
                      Pattern, Match,
-                     partialmethod, cached_property, # XXX RUSTPYTHON TODO: partial
-                     # XXX RUSTPYTHON TODO: AbstractContextManager, AbstractAsyncContextManager,
+                     partial, partialmethod, cached_property,
+                     AbstractContextManager, AbstractAsyncContextManager,
                      Awaitable, Coroutine,
                      AsyncIterable, AsyncIterator,
                      AsyncGenerator, Generator,
                      Iterable, Iterator,
                      Reversible,
                      Container, Collection,
-                     # XXX RUSTPYTHON TODO: Mailbox, _PartialFile,
-                     # XXX RUSTPYTHON TODO: ContextVar, Token,
+                     Mailbox, _PartialFile,
+                     ContextVar, Token,
                      Field,
                      Set, MutableSet,
                      Mapping, MutableMapping, MappingView,
@@ -85,6 +85,8 @@ class BaseTest(unittest.TestCase):
     if ctypes is not None:
         generic_types.extend((ctypes.Array, ctypes.LibraryLoader))
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_subscriptable(self):
         for t in self.generic_types:
             if t is None:
@@ -154,8 +156,6 @@ class BaseTest(unittest.TestCase):
         self.assertEqual(t.__args__, (int,))
         self.assertEqual(t.__parameters__, ())
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_repr(self):
         class MyList(list):
             pass
@@ -303,8 +303,6 @@ class BaseTest(unittest.TestCase):
         self.assertEqual(a.__args__, (list[int], list[str]))
         self.assertEqual(a.__parameters__, ())
 
-    # TODO: RUSTPYTHON
-    @unittest.expectedFailure
     def test_union_generic(self):
         a = typing.Union[list[T], tuple[T, ...]]
         self.assertEqual(a.__args__, (list[T], tuple[T, ...]))
@@ -316,6 +314,8 @@ class BaseTest(unittest.TestCase):
         for generic_alias_property in ("__origin__", "__args__", "__parameters__"):
             self.assertIn(generic_alias_property, dir_of_gen_alias)
 
+    # TODO: RUSTPYTHON
+    @unittest.expectedFailure
     def test_weakref(self):
         for t in self.generic_types:
             if t is None:

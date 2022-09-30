@@ -1,6 +1,6 @@
 use cranelift::prelude::*;
 use num_traits::cast::ToPrimitive;
-use rustpython_bytecode::{
+use rustpython_compiler_core::{
     self as bytecode, BinaryOperator, BorrowedConstant, CodeObject, ComparisonOperator,
     Instruction, Label, UnaryOperator,
 };
@@ -266,7 +266,6 @@ impl<'a, 'b> FunctionCompiler<'a, 'b> {
                             ComparisonOperator::LessOrEqual => IntCC::SignedLessThanOrEqual,
                             ComparisonOperator::Greater => IntCC::SignedGreaterThan,
                             ComparisonOperator::GreaterOrEqual => IntCC::SignedLessThanOrEqual,
-                            _ => return Err(JitCompileError::NotSupported),
                         };
 
                         let val = self.builder.ins().icmp(cond, a.val, b.val);

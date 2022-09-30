@@ -1,10 +1,14 @@
-use super::{IterStatus, PositionIterInternal, PyGenericAlias, PyIntRef, PyTupleRef, PyTypeRef};
+use super::{
+    IterStatus, PositionIterInternal, PyGenericAlias, PyIntRef, PyTupleRef, PyType, PyTypeRef,
+};
 use crate::common::lock::{PyMutex, PyRwLock};
 use crate::{
-    function::{IntoPyObject, OptionalArg},
+    class::PyClassImpl,
+    convert::ToPyObject,
+    function::OptionalArg,
     protocol::{PyIter, PyIterReturn},
     types::{Constructor, IterNext, IterNextIterable},
-    ItemProtocol, PyClassImpl, PyContext, PyObjectRef, PyResult, PyValue, VirtualMachine,
+    AsObject, Context, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
 };
 use num_bigint::BigInt;
 use num_traits::Zero;
@@ -16,9 +20,9 @@ pub struct PyEnumerate {
     iterator: PyIter,
 }
 
-impl PyValue for PyEnumerate {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.enumerate_type
+impl PyPayload for PyEnumerate {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.enumerate_type
     }
 }
 
@@ -42,21 +46,29 @@ impl Constructor for PyEnumerate {
             counter: PyRwLock::new(counter),
             iterator,
         }
-        .into_pyresult_with_type(vm, cls)
+        .into_ref_with_type(vm, cls)
+        .map(Into::into)
     }
 }
 
-#[pyimpl(with(IterNext, Constructor), flags(BASETYPE))]
+#[pyclass(with(IterNext, Constructor), flags(BASETYPE))]
 impl PyEnumerate {
     #[pyclassmethod(magic)]
     fn class_getitem(cls: PyTypeRef, args: PyObjectRef, vm: &VirtualMachine) -> PyGenericAlias {
         PyGenericAlias::new(cls, args, vm)
     }
+    #[pymethod(magic)]
+    fn reduce(zelf: PyRef<Self>) -> (PyTypeRef, (PyIter, BigInt)) {
+        (
+            zelf.class().clone(),
+            (zelf.iterator.clone(), zelf.counter.read().clone()),
+        )
+    }
 }
 
 impl IterNextIterable for PyEnumerate {}
 impl IterNext for PyEnumerate {
-    fn next(zelf: &crate::PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+    fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         let next_obj = match zelf.iterator.next(vm)? {
             PyIterReturn::StopIteration(v) => return Ok(PyIterReturn::StopIteration(v)),
             PyIterReturn::Return(obj) => obj,
@@ -64,7 +76,7 @@ impl IterNext for PyEnumerate {
         let mut counter = zelf.counter.write();
         let position = counter.clone();
         *counter += 1;
-        Ok(PyIterReturn::Return((position, next_obj).into_pyobject(vm)))
+        Ok(PyIterReturn::Return((position, next_obj).to_pyobject(vm)))
     }
 }
 
@@ -74,13 +86,13 @@ pub struct PyReverseSequenceIterator {
     internal: PyMutex<PositionIterInternal<PyObjectRef>>,
 }
 
-impl PyValue for PyReverseSequenceIterator {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.reverse_iter_type
+impl PyPayload for PyReverseSequenceIterator {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.reverse_iter_type
     }
 }
 
-#[pyimpl(with(IterNext))]
+#[pyclass(with(IterNext))]
 impl PyReverseSequenceIterator {
     pub fn new(obj: PyObjectRef, len: usize) -> Self {
         let position = len.saturating_sub(1);
@@ -115,14 +127,14 @@ impl PyReverseSequenceIterator {
 
 impl IterNextIterable for PyReverseSequenceIterator {}
 impl IterNext for PyReverseSequenceIterator {
-    fn next(zelf: &crate::PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+    fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         zelf.internal
             .lock()
-            .rev_next(|obj, pos| PyIterReturn::from_getitem_result(obj.get_item(pos, vm), vm))
+            .rev_next(|obj, pos| PyIterReturn::from_getitem_result(obj.get_item(&pos, vm), vm))
     }
 }
 
-pub fn init(context: &PyContext) {
-    PyEnumerate::extend_class(context, &context.types.enumerate_type);
-    PyReverseSequenceIterator::extend_class(context, &context.types.reverse_iter_type);
+pub fn init(context: &Context) {
+    PyEnumerate::extend_class(context, context.types.enumerate_type);
+    PyReverseSequenceIterator::extend_class(context, context.types.reverse_iter_type);
 }

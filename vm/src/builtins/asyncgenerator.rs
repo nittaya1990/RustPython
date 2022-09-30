@@ -1,13 +1,13 @@
-use super::{PyCode, PyGenericAlias, PyStrRef, PyTypeRef};
+use super::{PyCode, PyGenericAlias, PyStrRef, PyType, PyTypeRef};
 use crate::{
     builtins::PyBaseExceptionRef,
+    class::PyClassImpl,
     coroutine::Coro,
     frame::FrameRef,
     function::OptionalArg,
     protocol::PyIterReturn,
     types::{Constructor, IterNext, IterNextIterable, Unconstructible},
-    IdProtocol, PyClassImpl, PyContext, PyObjectRef, PyRef, PyResult, PyValue, TypeProtocol,
-    VirtualMachine,
+    AsObject, Context, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
 };
 
 use crossbeam_utils::atomic::AtomicCell;
@@ -20,13 +20,13 @@ pub struct PyAsyncGen {
 }
 type PyAsyncGenRef = PyRef<PyAsyncGen>;
 
-impl PyValue for PyAsyncGen {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.async_generator
+impl PyPayload for PyAsyncGen {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.async_generator
     }
 }
 
-#[pyimpl(with(Constructor))]
+#[pyclass(with(Constructor))]
 impl PyAsyncGen {
     pub fn as_coro(&self) -> &Coro {
         &self.inner
@@ -39,12 +39,12 @@ impl PyAsyncGen {
         }
     }
 
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn name(&self) -> PyStrRef {
         self.inner.name()
     }
 
-    #[pyproperty(magic, setter)]
+    #[pygetset(magic, setter)]
     fn set_name(&self, name: PyStrRef) {
         self.inner.set_name(name)
     }
@@ -100,26 +100,26 @@ impl PyAsyncGen {
             aclose: true,
             state: AtomicCell::new(AwaitableState::Init),
             value: (
-                vm.ctx.exceptions.generator_exit.clone().into(),
+                vm.ctx.exceptions.generator_exit.to_owned().into(),
                 vm.ctx.none(),
                 vm.ctx.none(),
             ),
         }
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn ag_await(&self, _vm: &VirtualMachine) -> Option<PyObjectRef> {
         self.inner.frame().yield_from_target()
     }
-    #[pyproperty]
+    #[pygetset]
     fn ag_frame(&self, _vm: &VirtualMachine) -> FrameRef {
         self.inner.frame()
     }
-    #[pyproperty]
+    #[pygetset]
     fn ag_running(&self, _vm: &VirtualMachine) -> bool {
         self.inner.running()
     }
-    #[pyproperty]
+    #[pygetset]
     fn ag_code(&self, _vm: &VirtualMachine) -> PyRef<PyCode> {
         self.inner.frame().code.clone()
     }
@@ -134,20 +134,20 @@ impl Unconstructible for PyAsyncGen {}
 #[pyclass(module = false, name = "async_generator_wrapped_value")]
 #[derive(Debug)]
 pub(crate) struct PyAsyncGenWrappedValue(pub PyObjectRef);
-impl PyValue for PyAsyncGenWrappedValue {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.async_generator_wrapped_value
+impl PyPayload for PyAsyncGenWrappedValue {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.async_generator_wrapped_value
     }
 }
 
-#[pyimpl]
+#[pyclass]
 impl PyAsyncGenWrappedValue {}
 
 impl PyAsyncGenWrappedValue {
     fn unbox(ag: &PyAsyncGen, val: PyResult<PyIterReturn>, vm: &VirtualMachine) -> PyResult {
         let (closed, async_done) = match &val {
             Ok(PyIterReturn::StopIteration(_)) => (true, true),
-            Err(e) if e.isinstance(&vm.ctx.exceptions.generator_exit) => (true, true),
+            Err(e) if e.fast_isinstance(vm.ctx.exceptions.generator_exit) => (true, true),
             Err(_) => (false, true),
             _ => (false, false),
         };
@@ -183,13 +183,13 @@ pub(crate) struct PyAsyncGenASend {
     value: PyObjectRef,
 }
 
-impl PyValue for PyAsyncGenASend {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.async_generator_asend
+impl PyPayload for PyAsyncGenASend {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.async_generator_asend
     }
 }
 
-#[pyimpl(with(IterNext))]
+#[pyclass(with(IterNext))]
 impl PyAsyncGenASend {
     #[pymethod(name = "__await__")]
     fn r#await(zelf: PyRef<Self>, _vm: &VirtualMachine) -> PyRef<Self> {
@@ -264,7 +264,7 @@ impl PyAsyncGenASend {
 
 impl IterNextIterable for PyAsyncGenASend {}
 impl IterNext for PyAsyncGenASend {
-    fn next(zelf: &crate::PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+    fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         PyIterReturn::from_pyresult(zelf.send(vm.ctx.none(), vm), vm)
     }
 }
@@ -278,13 +278,13 @@ pub(crate) struct PyAsyncGenAThrow {
     value: (PyObjectRef, PyObjectRef, PyObjectRef),
 }
 
-impl PyValue for PyAsyncGenAThrow {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.async_generator_athrow
+impl PyPayload for PyAsyncGenAThrow {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.async_generator_athrow
     }
 }
 
-#[pyimpl(with(IterNext))]
+#[pyclass(with(IterNext))]
 impl PyAsyncGenAThrow {
     #[pymethod(name = "__await__")]
     fn r#await(zelf: PyRef<Self>, _vm: &VirtualMachine) -> PyRef<Self> {
@@ -398,8 +398,8 @@ impl PyAsyncGenAThrow {
         self.ag.running_async.store(false);
         self.state.store(AwaitableState::Closed);
         if self.aclose
-            && (exc.isinstance(&vm.ctx.exceptions.stop_async_iteration)
-                || exc.isinstance(&vm.ctx.exceptions.generator_exit))
+            && (exc.fast_isinstance(vm.ctx.exceptions.stop_async_iteration)
+                || exc.fast_isinstance(vm.ctx.exceptions.generator_exit))
         {
             vm.new_stop_iteration(None)
         } else {
@@ -410,13 +410,13 @@ impl PyAsyncGenAThrow {
 
 impl IterNextIterable for PyAsyncGenAThrow {}
 impl IterNext for PyAsyncGenAThrow {
-    fn next(zelf: &crate::PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+    fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         PyIterReturn::from_pyresult(zelf.send(vm.ctx.none(), vm), vm)
     }
 }
 
-pub fn init(ctx: &PyContext) {
-    PyAsyncGen::extend_class(ctx, &ctx.types.async_generator);
-    PyAsyncGenASend::extend_class(ctx, &ctx.types.async_generator_asend);
-    PyAsyncGenAThrow::extend_class(ctx, &ctx.types.async_generator_athrow);
+pub fn init(ctx: &Context) {
+    PyAsyncGen::extend_class(ctx, ctx.types.async_generator);
+    PyAsyncGenASend::extend_class(ctx, ctx.types.async_generator_asend);
+    PyAsyncGenAThrow::extend_class(ctx, ctx.types.async_generator_athrow);
 }

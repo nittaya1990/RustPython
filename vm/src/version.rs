@@ -1,58 +1,27 @@
 /* Several function to retrieve version information.
  */
 
-use crate::PyStructSequence;
-use chrono::prelude::DateTime;
-use chrono::Local;
+use chrono::{prelude::DateTime, Local};
 use std::time::{Duration, UNIX_EPOCH};
 
-// = 3.9.0alpha
-const MAJOR: usize = 3;
-const MINOR: usize = 9;
-const MICRO: usize = 0;
-const RELEASELEVEL: &str = "alpha";
-const RELEASELEVEL_N: usize = 0xA;
-const SERIAL: usize = 0;
+// = 3.10.0alpha
+pub const MAJOR: usize = 3;
+pub const MINOR: usize = 10;
+pub const MICRO: usize = 0;
+pub const RELEASELEVEL: &str = "alpha";
+pub const RELEASELEVEL_N: usize = 0xA;
+pub const SERIAL: usize = 0;
 
 pub const VERSION_HEX: usize =
     (MAJOR << 24) | (MINOR << 16) | (MICRO << 8) | (RELEASELEVEL_N << 4) | SERIAL;
 
-#[pyclass(module = "sys", name = "version_info")]
-#[derive(Default, Debug, PyStructSequence)]
-pub struct VersionInfo {
-    major: usize,
-    minor: usize,
-    micro: usize,
-    releaselevel: &'static str,
-    serial: usize,
-}
-
 pub fn get_version() -> String {
     format!(
-        "{:.80} ({:.80}) \n[{:.80}]",
+        "{:.80} ({:.80}) \n[{:.80}]", // \n is PyPy convention
         get_version_number(),
         get_build_info(),
         get_compiler()
     )
-}
-
-#[pyimpl(with(PyStructSequence))]
-impl VersionInfo {
-    pub const VERSION: VersionInfo = VersionInfo {
-        major: MAJOR,
-        minor: MINOR,
-        micro: MICRO,
-        releaselevel: RELEASELEVEL,
-        serial: SERIAL,
-    };
-    #[pyslot]
-    fn slot_new(
-        _cls: crate::builtins::pytype::PyTypeRef,
-        _args: crate::function::FuncArgs,
-        vm: &crate::VirtualMachine,
-    ) -> crate::PyResult {
-        Err(vm.new_type_error("cannot create 'sys.version_info' instances".to_owned()))
-    }
 }
 
 pub fn get_version_number() -> String {

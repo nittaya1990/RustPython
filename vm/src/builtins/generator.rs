@@ -2,14 +2,15 @@
  * The mythical generator.
  */
 
-use super::{PyCode, PyStrRef, PyTypeRef};
+use super::{PyCode, PyStrRef, PyType};
 use crate::{
+    class::PyClassImpl,
     coroutine::Coro,
     frame::FrameRef,
     function::OptionalArg,
     protocol::PyIterReturn,
     types::{Constructor, IterNext, IterNextIterable, Unconstructible},
-    IdProtocol, PyClassImpl, PyContext, PyObjectRef, PyRef, PyResult, PyValue, VirtualMachine,
+    AsObject, Context, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
 };
 
 #[pyclass(module = false, name = "generator")]
@@ -18,13 +19,13 @@ pub struct PyGenerator {
     inner: Coro,
 }
 
-impl PyValue for PyGenerator {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.generator_type
+impl PyPayload for PyGenerator {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.generator_type
     }
 }
 
-#[pyimpl(with(Constructor, IterNext))]
+#[pyclass(with(Constructor, IterNext))]
 impl PyGenerator {
     pub fn as_coro(&self) -> &Coro {
         &self.inner
@@ -36,12 +37,12 @@ impl PyGenerator {
         }
     }
 
-    #[pyproperty(magic)]
+    #[pygetset(magic)]
     fn name(&self) -> PyStrRef {
         self.inner.name()
     }
 
-    #[pyproperty(magic, setter)]
+    #[pygetset(magic, setter)]
     fn set_name(&self, name: PyStrRef) {
         self.inner.set_name(name)
     }
@@ -78,19 +79,19 @@ impl PyGenerator {
         zelf.inner.close(zelf.as_object(), vm)
     }
 
-    #[pyproperty]
+    #[pygetset]
     fn gi_frame(&self, _vm: &VirtualMachine) -> FrameRef {
         self.inner.frame()
     }
-    #[pyproperty]
+    #[pygetset]
     fn gi_running(&self, _vm: &VirtualMachine) -> bool {
         self.inner.running()
     }
-    #[pyproperty]
+    #[pygetset]
     fn gi_code(&self, _vm: &VirtualMachine) -> PyRef<PyCode> {
         self.inner.frame().code.clone()
     }
-    #[pyproperty]
+    #[pygetset]
     fn gi_yieldfrom(&self, _vm: &VirtualMachine) -> Option<PyObjectRef> {
         self.inner.frame().yield_from_target()
     }
@@ -99,11 +100,11 @@ impl Unconstructible for PyGenerator {}
 
 impl IterNextIterable for PyGenerator {}
 impl IterNext for PyGenerator {
-    fn next(zelf: &crate::PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+    fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         Self::send(zelf.to_owned(), vm.ctx.none(), vm)
     }
 }
 
-pub fn init(ctx: &PyContext) {
-    PyGenerator::extend_class(ctx, &ctx.types.generator_type);
+pub fn init(ctx: &Context) {
+    PyGenerator::extend_class(ctx, ctx.types.generator_type);
 }

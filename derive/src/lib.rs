@@ -13,16 +13,16 @@ mod error;
 mod util;
 
 mod compile_bytecode;
-mod doc;
 mod from_args;
 mod pyclass;
 mod pymodule;
+mod pypayload;
 mod pystructseq;
-mod pyvalue;
 
 use error::{extract_spans, Diagnostic};
 use proc_macro2::TokenStream;
 use quote::ToTokens;
+use rustpython_doc as doc;
 use syn::{parse_macro_input, AttributeArgs, DeriveInput, Item};
 
 fn result_to_tokens(result: Result<TokenStream, impl Into<Diagnostic>>) -> proc_macro::TokenStream {
@@ -45,7 +45,11 @@ pub fn pyclass(
 ) -> proc_macro::TokenStream {
     let attr = parse_macro_input!(attr as AttributeArgs);
     let item = parse_macro_input!(item as Item);
-    result_to_tokens(pyclass::impl_pyclass(attr, item))
+    if matches!(item, syn::Item::Impl(_) | syn::Item::Trait(_)) {
+        result_to_tokens(pyclass::impl_pyimpl(attr, item))
+    } else {
+        result_to_tokens(pyclass::impl_pyclass(attr, item))
+    }
 }
 
 /// This macro serves a goal of generating multiple
@@ -77,16 +81,6 @@ pub fn pyexception(
 }
 
 #[proc_macro_attribute]
-pub fn pyimpl(
-    attr: proc_macro::TokenStream,
-    item: proc_macro::TokenStream,
-) -> proc_macro::TokenStream {
-    let attr = parse_macro_input!(attr as AttributeArgs);
-    let item = parse_macro_input!(item as Item);
-    result_to_tokens(pyclass::impl_pyimpl(attr, item))
-}
-
-#[proc_macro_attribute]
 pub fn pymodule(
     attr: proc_macro::TokenStream,
     item: proc_macro::TokenStream,
@@ -102,6 +96,14 @@ pub fn pystruct_sequence(input: proc_macro::TokenStream) -> proc_macro::TokenStr
     result_to_tokens(pystructseq::impl_pystruct_sequence(input))
 }
 
+#[proc_macro_derive(TryIntoPyStructSequence)]
+pub fn pystruct_sequence_try_from_object(
+    input: proc_macro::TokenStream,
+) -> proc_macro::TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    result_to_tokens(pystructseq::impl_pystruct_sequence_try_from_object(input))
+}
+
 #[proc_macro]
 pub fn py_compile(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     result_to_tokens(compile_bytecode::impl_py_compile(input.into()))
@@ -112,8 +114,8 @@ pub fn py_freeze(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     result_to_tokens(compile_bytecode::impl_py_freeze(input.into()))
 }
 
-#[proc_macro_derive(PyValue)]
-pub fn pyvalue(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+#[proc_macro_derive(PyPayload)]
+pub fn pypayload(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    result_to_tokens(pyvalue::impl_pyvalue(input))
+    result_to_tokens(pypayload::impl_pypayload(input))
 }

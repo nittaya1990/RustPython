@@ -1,14 +1,9 @@
-use crate::{
-    builtins::{pystr::IntoPyStrRef, PyDictRef, PyStrRef},
-    function::IntoPyObject,
-    protocol::PyMapping,
-    ItemProtocol, VirtualMachine,
-};
+use crate::{builtins::PyDictRef, function::ArgMapping, VirtualMachine};
 use std::fmt;
 
 #[derive(Clone)]
 pub struct Scope {
-    pub locals: PyMapping,
+    pub locals: ArgMapping,
     pub globals: PyDictRef,
 }
 
@@ -21,19 +16,19 @@ impl fmt::Debug for Scope {
 
 impl Scope {
     #[inline]
-    pub fn new(locals: Option<PyMapping>, globals: PyDictRef) -> Scope {
-        let locals = locals.unwrap_or_else(|| PyMapping::new(globals.clone().into()));
+    pub fn new(locals: Option<ArgMapping>, globals: PyDictRef) -> Scope {
+        let locals = locals.unwrap_or_else(|| ArgMapping::from_dict_exact(globals.clone()));
         Scope { locals, globals }
     }
 
     pub fn with_builtins(
-        locals: Option<PyMapping>,
+        locals: Option<ArgMapping>,
         globals: PyDictRef,
         vm: &VirtualMachine,
     ) -> Scope {
         if !globals.contains_key("__builtins__", vm) {
             globals
-                .set_item("__builtins__", vm.builtins.clone(), vm)
+                .set_item("__builtins__", vm.builtins.clone().into(), vm)
                 .unwrap();
         }
         Scope::new(locals, globals)
@@ -60,7 +55,7 @@ impl Scope {
     //     }
     // }
 
-    // pub fn new_child_scope(&self, ctx: &PyContext) -> Scope {
+    // pub fn new_child_scope(&self, ctx: &Context) -> Scope {
     //     self.new_child_scope_with_locals(ctx.new_dict())
     // }
 
@@ -131,7 +126,7 @@ impl Scope {
     //     if let Some(value) = self.globals.get_item_option(name.clone(), vm).unwrap() {
     //         Some(value)
     //     } else {
-    //         vm.builtins.clone().get_attr(name, vm).ok()
+    //         vm.builtins.get_attr(name, vm).ok()
     //     }
     // }
 
@@ -140,14 +135,14 @@ impl Scope {
     // }
 }
 
-mod sealed {
-    pub trait Sealed {}
-    impl Sealed for &str {}
-    impl Sealed for super::PyStrRef {}
-}
-pub trait PyName:
-    sealed::Sealed + crate::dictdatatype::DictKey + Clone + IntoPyObject + IntoPyStrRef
-{
-}
-impl PyName for &str {}
-impl PyName for PyStrRef {}
+// mod sealed {
+//     pub trait Sealed {}
+//     impl Sealed for &str {}
+//     impl Sealed for super::PyStrRef {}
+// }
+// pub trait PyName:
+//     sealed::Sealed + crate::dictdatatype::DictKey + Clone + ToPyObject + IntoPyStrRef
+// {
+// }
+// impl PyName for str {}
+// impl PyName for Py<PyStr> {}

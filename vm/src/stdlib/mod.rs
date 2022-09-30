@@ -1,6 +1,6 @@
 #[cfg(feature = "rustpython-ast")]
 pub(crate) mod ast;
-mod atexit;
+pub mod atexit;
 pub mod builtins;
 mod codecs;
 mod collections;
@@ -11,7 +11,6 @@ pub mod io;
 mod itertools;
 mod marshal;
 mod operator;
-pub(crate) mod pystruct;
 // TODO: maybe make this an extension module, if we ever get those
 // mod re;
 mod sre;
@@ -22,7 +21,7 @@ mod sysconfigdata;
 #[cfg(feature = "threading")]
 mod thread;
 pub mod time;
-mod warnings;
+pub mod warnings;
 mod weakref;
 
 #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
@@ -49,13 +48,10 @@ mod winapi;
 #[cfg(windows)]
 mod winreg;
 
-use crate::vm::VirtualMachine;
-use crate::PyObjectRef;
-use std::borrow::Cow;
-use std::collections::HashMap;
+use crate::{PyObjectRef, VirtualMachine};
+use std::{borrow::Cow, collections::HashMap};
 
 pub type StdlibInitFunc = Box<py_dyn_fn!(dyn Fn(&VirtualMachine) -> PyObjectRef)>;
-
 pub type StdlibMap = HashMap<Cow<'static, str>, StdlibInitFunc, ahash::RandomState>;
 
 pub fn get_module_inits() -> StdlibMap {
@@ -88,7 +84,6 @@ pub fn get_module_inits() -> StdlibMap {
             "_operator" => operator::make_module,
             "_sre" => sre::make_module,
             "_string" => string::make_module,
-            "_struct" => pystruct::make_module,
             "time" => time::make_module,
             "_weakref" => weakref::make_module,
             "_imp" => imp::make_module,
@@ -115,7 +110,7 @@ pub fn get_module_inits() -> StdlibMap {
         {
             "_signal" => signal::make_module,
         }
-        #[cfg(all(feature = "threading", not(target_arch = "wasm32")))]
+        #[cfg(feature = "threading")]
         {
             "_thread" => thread::make_module,
         }

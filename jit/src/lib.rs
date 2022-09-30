@@ -1,18 +1,14 @@
-#![allow(clippy::unnecessary_wraps)]
-use std::fmt;
+mod instructions;
 
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, ModuleError};
-
-use rustpython_bytecode as bytecode;
-
-mod instructions;
-
 use instructions::FunctionCompiler;
-use std::mem::ManuallyDrop;
+use rustpython_compiler_core as bytecode;
+use std::{fmt, mem::ManuallyDrop};
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum JitCompileError {
     #[error("function can't be jitted")]
     NotSupported,
@@ -23,6 +19,7 @@ pub enum JitCompileError {
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum JitArgumentError {
     #[error("argument is of wrong type")]
     ArgumentTypeMismatch,
@@ -166,7 +163,8 @@ impl JitSig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum JitType {
     Int,
     Float,
@@ -192,6 +190,7 @@ impl JitType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum AbiValue {
     Float(f64),
     Int(i64),
@@ -286,6 +285,8 @@ impl UnTypedAbiValue {
     }
 }
 
+// we don't actually ever touch CompiledCode til we drop it, it should be safe.
+// TODO: confirm with wasmtime ppl that it's not unsound?
 unsafe impl Send for CompiledCode {}
 unsafe impl Sync for CompiledCode {}
 

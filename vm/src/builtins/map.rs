@@ -1,9 +1,11 @@
-use super::PyTypeRef;
+use super::{PyType, PyTypeRef};
 use crate::{
+    builtins::PyTupleRef,
+    class::PyClassImpl,
     function::PosArgs,
     protocol::{PyIter, PyIterReturn},
     types::{Constructor, IterNext, IterNextIterable},
-    PyClassImpl, PyContext, PyObjectRef, PyResult, PyValue, VirtualMachine,
+    Context, Py, PyObjectRef, PyPayload, PyResult, VirtualMachine,
 };
 
 /// map(func, *iterables) --> map object
@@ -17,9 +19,9 @@ pub struct PyMap {
     iterators: Vec<PyIter>,
 }
 
-impl PyValue for PyMap {
-    fn class(vm: &VirtualMachine) -> &PyTypeRef {
-        &vm.ctx.types.map_type
+impl PyPayload for PyMap {
+    fn class(vm: &VirtualMachine) -> &'static Py<PyType> {
+        vm.ctx.types.map_type
     }
 }
 
@@ -28,11 +30,13 @@ impl Constructor for PyMap {
 
     fn py_new(cls: PyTypeRef, (mapper, iterators): Self::Args, vm: &VirtualMachine) -> PyResult {
         let iterators = iterators.into_vec();
-        PyMap { mapper, iterators }.into_pyresult_with_type(vm, cls)
+        PyMap { mapper, iterators }
+            .into_ref_with_type(vm, cls)
+            .map(Into::into)
     }
 }
 
-#[pyimpl(with(IterNext, Constructor), flags(BASETYPE))]
+#[pyclass(with(IterNext, Constructor), flags(BASETYPE))]
 impl PyMap {
     #[pymethod(magic)]
     fn length_hint(&self, vm: &VirtualMachine) -> PyResult<usize> {
@@ -42,13 +46,20 @@ impl PyMap {
             Ok(max)
         })
     }
+
+    #[pymethod(magic)]
+    fn reduce(&self, vm: &VirtualMachine) -> (PyTypeRef, PyTupleRef) {
+        let mut vec = vec![self.mapper.clone()];
+        vec.extend(self.iterators.iter().map(|o| o.clone().into()));
+        (vm.ctx.types.map_type.to_owned(), vm.new_tuple(vec))
+    }
 }
 
 impl IterNextIterable for PyMap {}
 impl IterNext for PyMap {
-    fn next(zelf: &crate::PyObjectView<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+    fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         let mut next_objs = Vec::new();
-        for iterator in zelf.iterators.iter() {
+        for iterator in &zelf.iterators {
             let item = match iterator.next(vm)? {
                 PyIterReturn::Return(obj) => obj,
                 PyIterReturn::StopIteration(v) => return Ok(PyIterReturn::StopIteration(v)),
@@ -61,6 +72,6 @@ impl IterNext for PyMap {
     }
 }
 
-pub fn init(context: &PyContext) {
-    PyMap::extend_class(context, &context.types.map_type);
+pub fn init(context: &Context) {
+    PyMap::extend_class(context, context.types.map_type);
 }

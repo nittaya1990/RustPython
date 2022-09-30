@@ -12,22 +12,23 @@ pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
 pub(crate) mod module {
     use crate::{
         builtins::{PyStrRef, PyTupleRef},
-        crt_fd::Fd,
-        function::{IntoPyException, OptionalArg},
+        common::{crt_fd::Fd, os::errno, suppress_iph},
+        convert::ToPyException,
+        function::Either,
+        function::OptionalArg,
         stdlib::os::{
             errno_err, DirFd, FollowSymlinks, PyPathLike, SupportFunc, TargetIsDirectory, _os,
-            errno,
         },
-        suppress_iph,
-        utils::Either,
         PyResult, TryFromObject, VirtualMachine,
     };
-    use std::io;
-    use std::{env, fs};
+    use std::{
+        env, fs, io,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+    };
 
+    use crate::builtins::PyDictRef;
     #[cfg(target_env = "msvc")]
     use crate::builtins::PyListRef;
-    use crate::{builtins::PyDictRef, ItemProtocol};
     use winapi::{um, vc::vcruntime::intptr_t};
 
     #[pyattr]
@@ -68,12 +69,12 @@ pub(crate) mod module {
         } else {
             win_fs::symlink_file(args.src.path, args.dst.path)
         };
-        res.map_err(|err| err.into_pyexception(vm))
+        res.map_err(|err| err.to_pyexception(vm))
     }
 
     #[pyfunction]
     fn set_inheritable(fd: i32, inheritable: bool, vm: &VirtualMachine) -> PyResult<()> {
-        let handle = Fd(fd).to_raw_handle().map_err(|e| e.into_pyexception(vm))?;
+        let handle = Fd(fd).to_raw_handle().map_err(|e| e.to_pyexception(vm))?;
         set_handle_inheritable(handle as _, inheritable, vm)
     }
 
@@ -82,9 +83,7 @@ pub(crate) mod module {
         let environ = vm.ctx.new_dict();
 
         for (key, value) in env::vars() {
-            environ
-                .set_item(vm.new_pyobj(key), vm.new_pyobj(value), vm)
-                .unwrap();
+            environ.set_item(&key, vm.new_pyobj(value), vm).unwrap();
         }
         environ
     }
@@ -104,10 +103,10 @@ pub(crate) mod module {
         } else {
             fs::symlink_metadata(&path)
         };
-        let meta = metadata.map_err(|err| err.into_pyexception(vm))?;
+        let meta = metadata.map_err(|err| err.to_pyexception(vm))?;
         let mut permissions = meta.permissions();
         permissions.set_readonly(mode & S_IWRITE == 0);
-        fs::set_permissions(&path, permissions).map_err(|err| err.into_pyexception(vm))
+        fs::set_permissions(&path, permissions).map_err(|err| err.to_pyexception(vm))
     }
 
     // cwait is available on MSVC only (according to CPython)
@@ -193,33 +192,6 @@ pub(crate) mod module {
     }
 
     #[cfg(target_env = "msvc")]
-    type InvalidParamHandler = extern "C" fn(
-        *const libc::wchar_t,
-        *const libc::wchar_t,
-        *const libc::wchar_t,
-        libc::c_uint,
-        libc::uintptr_t,
-    );
-    #[cfg(target_env = "msvc")]
-    extern "C" {
-        #[doc(hidden)]
-        pub fn _set_thread_local_invalid_parameter_handler(
-            pNew: InvalidParamHandler,
-        ) -> InvalidParamHandler;
-    }
-
-    #[cfg(target_env = "msvc")]
-    #[doc(hidden)]
-    pub extern "C" fn silent_iph_handler(
-        _: *const libc::wchar_t,
-        _: *const libc::wchar_t,
-        _: *const libc::wchar_t,
-        _: libc::c_uint,
-        _: libc::uintptr_t,
-    ) {
-    }
-
-    #[cfg(target_env = "msvc")]
     extern "C" {
         fn _wexecv(cmdname: *const u16, argv: *const *const u16) -> intptr_t;
     }
@@ -233,13 +205,12 @@ pub(crate) mod module {
     ) -> PyResult<()> {
         use std::iter::once;
 
-        let make_widestring = |s: &str| {
-            widestring::WideCString::from_os_str(s).map_err(|err| err.into_pyexception(vm))
-        };
+        let make_widestring =
+            |s: &str| widestring::WideCString::from_os_str(s).map_err(|err| err.to_pyexception(vm));
 
         let path = make_widestring(path.as_str())?;
 
-        let argv = vm.extract_elements_func(argv.as_ref(), |obj| {
+        let argv = vm.extract_elements_with(argv.as_ref(), |obj| {
             let arg = PyStrRef::try_from_object(vm, obj)?;
             make_widestring(arg.as_str())
         })?;
@@ -272,7 +243,7 @@ pub(crate) mod module {
         let real = path
             .as_ref()
             .canonicalize()
-            .map_err(|e| e.into_pyexception(vm))?;
+            .map_err(|e| e.to_pyexception(vm))?;
         path.mode.process_path(real, vm)
     }
 
@@ -305,7 +276,7 @@ pub(crate) mod module {
                 return Err(errno_err(vm));
             }
         }
-        let buffer = widestring::WideCString::from_vec_with_nul(buffer).unwrap();
+        let buffer = widestring::WideCString::from_vec_truncate(buffer);
         path.mode.process_path(buffer.to_os_string(), vm)
     }
 
@@ -320,8 +291,46 @@ pub(crate) mod module {
         if ret == 0 {
             return Err(errno_err(vm));
         }
-        let buffer = widestring::WideCString::from_vec_with_nul(buffer).unwrap();
+        let buffer = widestring::WideCString::from_vec_truncate(buffer);
         path.mode.process_path(buffer.to_os_string(), vm)
+    }
+
+    #[pyfunction]
+    fn _path_splitroot(path: PyPathLike, vm: &VirtualMachine) -> PyResult<(String, String)> {
+        let orig: Vec<_> = path.path.into_os_string().encode_wide().collect();
+        if orig.is_empty() {
+            return Ok(("".to_owned(), "".to_owned()));
+        }
+        let backslashed: Vec<_> = orig
+            .iter()
+            .copied()
+            .map(|c| if c == b'/' as u16 { b'\\' as u16 } else { c })
+            .chain(std::iter::once(0)) // null-terminated
+            .collect();
+
+        fn from_utf16(wstr: &[u16], vm: &VirtualMachine) -> PyResult<String> {
+            String::from_utf16(wstr).map_err(|e| vm.new_unicode_decode_error(e.to_string()))
+        }
+
+        let wbuf = windows::core::PCWSTR::from_raw(backslashed.as_ptr());
+        let (root, path) = match unsafe { windows::Win32::UI::Shell::PathCchSkipRoot(wbuf) } {
+            Ok(end) => {
+                assert!(!end.is_null());
+                let len: usize = unsafe { end.as_ptr().offset_from(wbuf.as_ptr()) }
+                    .try_into()
+                    .expect("len must be non-negative");
+                assert!(
+                    len < backslashed.len(), // backslashed is null-terminated
+                    "path: {:?} {} < {}",
+                    std::path::PathBuf::from(std::ffi::OsString::from_wide(&backslashed)),
+                    len,
+                    backslashed.len()
+                );
+                (from_utf16(&orig[..len], vm)?, from_utf16(&orig[len..], vm)?)
+            }
+            Err(_) => ("".to_owned(), from_utf16(&orig, vm)?),
+        };
+        Ok((root, path))
     }
 
     #[pyfunction]
@@ -354,7 +363,7 @@ pub(crate) mod module {
                 };
             }
         }
-        Err(err.into_pyexception(vm))
+        Err(err.to_pyexception(vm))
     }
 
     #[pyfunction]
@@ -385,7 +394,7 @@ pub(crate) mod module {
         inheritable: bool,
         vm: &VirtualMachine,
     ) -> PyResult<()> {
-        raw_set_handle_inheritable(handle, inheritable).map_err(|e| e.into_pyexception(vm))
+        raw_set_handle_inheritable(handle, inheritable).map_err(|e| e.to_pyexception(vm))
     }
 
     #[pyfunction]
@@ -409,19 +418,6 @@ pub(crate) mod module {
     pub(crate) fn support_funcs() -> Vec<SupportFunc> {
         Vec::new()
     }
-}
-
-#[cfg(all(windows, target_env = "msvc"))]
-#[macro_export]
-macro_rules! suppress_iph {
-    ($e:expr) => {{
-        let old = $crate::stdlib::nt::module::_set_thread_local_invalid_parameter_handler(
-            $crate::stdlib::nt::module::silent_iph_handler,
-        );
-        let ret = $e;
-        $crate::stdlib::nt::module::_set_thread_local_invalid_parameter_handler(old);
-        ret
-    }};
 }
 
 pub fn init_winsock() {

@@ -49,20 +49,19 @@ if os.name == 'nt':
                   'encoding (%s). Unicode filename tests may not be effective'
                   % (TESTFN_UNENCODABLE, sys.getfilesystemencoding()))
             TESTFN_UNENCODABLE = None
-# TODO: RUSTPYTHON comment out before
-# # Mac OS X denies unencodable filenames (invalid utf-8)
-# elif sys.platform != 'darwin':
-#     try:
-#         # ascii and utf-8 cannot encode the byte 0xff
-#         b'\xff'.decode(sys.getfilesystemencoding())
-#     except UnicodeDecodeError:
-#         # 0xff will be encoded using the surrogate character u+DCFF
-#         TESTFN_UNENCODABLE = TESTFN_ASCII \
-#             + b'-\xff'.decode(sys.getfilesystemencoding(), 'surrogateescape')
-#     else:
-#         # File system encoding (eg. ISO-8859-* encodings) can encode
-#         # the byte 0xff. Skip some unicode filename tests.
-#         pass
+# Mac OS X denies unencodable filenames (invalid utf-8)
+elif sys.platform != 'darwin':
+    try:
+        # ascii and utf-8 cannot encode the byte 0xff
+        b'\xff'.decode(sys.getfilesystemencoding())
+    except UnicodeDecodeError:
+        # 0xff will be encoded using the surrogate character u+DCFF
+        TESTFN_UNENCODABLE = TESTFN_ASCII \
+            + b'-\xff'.decode(sys.getfilesystemencoding(), 'surrogateescape')
+    else:
+        # File system encoding (eg. ISO-8859-* encodings) can encode
+        # the byte 0xff. Skip some unicode filename tests.
+        pass
 
 # FS_NONASCII: non-ASCII character encodable by os.fsencode(),
 # or an empty string if there is no such character.
@@ -290,7 +289,7 @@ if sys.platform.startswith("win"):
                 try:
                     mode = os.lstat(fullname).st_mode
                 except OSError as exc:
-                    print("os_helper.rmtree(): os.lstat(%r) failed with %s"
+                    print("support.rmtree(): os.lstat(%r) failed with %s"
                           % (fullname, exc),
                           file=sys.__stderr__)
                     mode = 0
@@ -456,6 +455,17 @@ def create_empty_file(filename):
     os.close(fd)
 
 
+@contextlib.contextmanager
+def open_dir_fd(path):
+    """Open a file descriptor to a directory."""
+    assert os.path.isdir(path)
+    dir_fd = os.open(path, os.O_RDONLY)
+    try:
+        yield dir_fd
+    finally:
+        os.close(dir_fd)
+
+
 def fs_is_case_insensitive(directory):
     """Detects if the file system for the specified directory
     is case-insensitive."""
@@ -599,10 +609,6 @@ class EnvironmentVarGuard(collections.abc.MutableMapping):
 
     def unset(self, envvar):
         del self[envvar]
-
-    def copy(self):
-        # We do what os.environ.copy() does.
-        return dict(self)
 
     def __enter__(self):
         return self

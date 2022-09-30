@@ -12,52 +12,49 @@ mod _operator {
     use crate::common::cmp;
     use crate::{
         builtins::{PyInt, PyIntRef, PyStrRef, PyTupleRef, PyTypeRef},
+        function::Either,
         function::{ArgBytesLike, FuncArgs, KwArgs, OptionalArg},
+        identifier,
         protocol::PyIter,
-        types::{
-            Callable, Constructor,
-            PyComparisonOp::{Eq, Ge, Gt, Le, Lt, Ne},
-        },
-        utils::Either,
-        vm::ReprGuard,
-        IdProtocol, ItemProtocol, PyObjectRef, PyObjectView, PyRef, PyResult, PyValue,
-        TypeProtocol, VirtualMachine,
+        recursion::ReprGuard,
+        types::{Callable, Constructor, PyComparisonOp},
+        AsObject, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
     };
 
     /// Same as a < b.
     #[pyfunction]
     fn lt(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        a.rich_compare(b, Lt, vm)
+        a.rich_compare(b, PyComparisonOp::Lt, vm)
     }
 
     /// Same as a <= b.
     #[pyfunction]
     fn le(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        a.rich_compare(b, Le, vm)
+        a.rich_compare(b, PyComparisonOp::Le, vm)
     }
 
     /// Same as a > b.
     #[pyfunction]
     fn gt(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        a.rich_compare(b, Gt, vm)
+        a.rich_compare(b, PyComparisonOp::Gt, vm)
     }
 
     /// Same as a >= b.
     #[pyfunction]
     fn ge(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        a.rich_compare(b, Ge, vm)
+        a.rich_compare(b, PyComparisonOp::Ge, vm)
     }
 
     /// Same as a == b.
     #[pyfunction]
     fn eq(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        a.rich_compare(b, Eq, vm)
+        a.rich_compare(b, PyComparisonOp::Eq, vm)
     }
 
     /// Same as a != b.
     #[pyfunction]
     fn ne(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        a.rich_compare(b, Ne, vm)
+        a.rich_compare(b, PyComparisonOp::Ne, vm)
     }
 
     /// Same as not a.
@@ -113,7 +110,7 @@ mod _operator {
     /// Return a converted to an integer. Equivalent to a.__index__().
     #[pyfunction]
     fn index(a: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyIntRef> {
-        vm.to_index(&a)
+        a.try_index(vm)
     }
 
     /// Return the bitwise inverse of the number obj. This is equivalent to ~obj.
@@ -142,7 +139,7 @@ mod _operator {
 
     /// Return a @ b
     #[pyfunction]
-    fn mat_mul(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+    fn matmul(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
         vm._matmul(&a, &b)
     }
 
@@ -200,7 +197,9 @@ mod _operator {
     #[pyfunction]
     fn concat(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
         // Best attempt at checking that a is sequence-like.
-        if !a.class().has_attr("__getitem__") || a.isinstance(&vm.ctx.types.dict_type) {
+        if !a.class().has_attr(identifier!(vm, __getitem__))
+            || a.fast_isinstance(vm.ctx.types.dict_type)
+        {
             return Err(
                 vm.new_type_error(format!("{} object can't be concatenated", a.class().name()))
             );
@@ -211,7 +210,7 @@ mod _operator {
     /// Return the outcome of the test b in a. Note the reversed operands.
     #[pyfunction]
     fn contains(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        vm._membership(a, b)
+        vm._contains(a, b)
     }
 
     /// Return the number of occurrences of b in a.
@@ -230,13 +229,13 @@ mod _operator {
     /// Remove the value of a at index b.
     #[pyfunction]
     fn delitem(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
-        a.del_item(b, vm)
+        a.del_item(&*b, vm)
     }
 
     /// Return the value of a at index b.
     #[pyfunction]
     fn getitem(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        a.get_item(b, vm)
+        a.get_item(&*b, vm)
     }
 
     /// Return the number of occurrences of b in a.
@@ -259,7 +258,7 @@ mod _operator {
         c: PyObjectRef,
         vm: &VirtualMachine,
     ) -> PyResult<()> {
-        a.set_item(b, c, vm)
+        a.set_item(&*b, c, vm)
     }
 
     /// Return an estimate of the number of items in obj.
@@ -273,7 +272,7 @@ mod _operator {
     fn length_hint(obj: PyObjectRef, default: OptionalArg, vm: &VirtualMachine) -> PyResult<usize> {
         let default: usize = default
             .map(|v| {
-                if !v.isinstance(&vm.ctx.types.int_type) {
+                if !v.fast_isinstance(vm.ctx.types.int_type) {
                     return Err(vm.new_type_error(format!(
                         "'{}' type cannot be interpreted as an integer",
                         v.class().name()
@@ -303,7 +302,9 @@ mod _operator {
     #[pyfunction]
     fn iconcat(a: PyObjectRef, b: PyObjectRef, vm: &VirtualMachine) -> PyResult {
         // Best attempt at checking that a is sequence-like.
-        if !a.class().has_attr("__getitem__") || a.isinstance(&vm.ctx.types.dict_type) {
+        if !a.class().has_attr(identifier!(vm, __getitem__))
+            || a.fast_isinstance(vm.ctx.types.dict_type)
+        {
             return Err(
                 vm.new_type_error(format!("{} object can't be concatenated", a.class().name()))
             );
@@ -424,18 +425,18 @@ mod _operator {
     /// (r.name.first, r.name.last).
     #[pyattr]
     #[pyclass(name = "attrgetter")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct PyAttrGetter {
         attrs: Vec<PyStrRef>,
     }
 
-    #[pyimpl(with(Callable, Constructor))]
+    #[pyclass(with(Callable, Constructor))]
     impl PyAttrGetter {
         #[pymethod(magic)]
         fn repr(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<String> {
             let fmt = if let Some(_guard) = ReprGuard::enter(vm, zelf.as_object()) {
                 let mut parts = Vec::with_capacity(zelf.attrs.len());
-                for part in zelf.attrs.iter() {
+                for part in &zelf.attrs {
                     parts.push(part.as_object().repr(vm)?.as_str().to_owned());
                 }
                 parts.join(", ")
@@ -447,13 +448,10 @@ mod _operator {
 
         #[pymethod(magic)]
         fn reduce(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<(PyTypeRef, PyTupleRef)> {
-            let attrs = vm.ctx.new_tuple(
-                zelf.attrs
-                    .iter()
-                    .map(|v| v.as_object().to_owned())
-                    .collect(),
-            );
-            Ok((zelf.clone_class(), attrs))
+            let attrs = vm
+                .ctx
+                .new_tuple(zelf.attrs.iter().map(|v| v.clone().into()).collect());
+            Ok((zelf.class().clone(), attrs))
         }
 
         // Go through dotted parts of string and call getattr on whatever is returned.
@@ -494,20 +492,22 @@ mod _operator {
                     return Err(vm.new_type_error("attribute name must be a string".to_owned()));
                 }
             }
-            PyAttrGetter { attrs }.into_pyresult_with_type(vm, cls)
+            PyAttrGetter { attrs }
+                .into_ref_with_type(vm, cls)
+                .map(Into::into)
         }
     }
 
     impl Callable for PyAttrGetter {
         type Args = PyObjectRef;
-        fn call(zelf: &PyObjectView<Self>, obj: Self::Args, vm: &VirtualMachine) -> PyResult {
+        fn call(zelf: &Py<Self>, obj: Self::Args, vm: &VirtualMachine) -> PyResult {
             // Handle case where we only have one attribute.
             if zelf.attrs.len() == 1 {
                 return Self::get_single_attr(obj, zelf.attrs[0].as_str(), vm);
             }
             // Build tuple and call get_single on each element in attrs.
             let mut results = Vec::with_capacity(zelf.attrs.len());
-            for o in zelf.attrs.iter() {
+            for o in &zelf.attrs {
                 results.push(Self::get_single_attr(obj.clone(), o.as_str(), vm)?);
             }
             Ok(vm.ctx.new_tuple(results).into())
@@ -521,18 +521,18 @@ mod _operator {
     /// After g = itemgetter(2, 5, 3), the call g(r) returns (r[2], r[5], r[3])
     #[pyattr]
     #[pyclass(name = "itemgetter")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct PyItemGetter {
         items: Vec<PyObjectRef>,
     }
 
-    #[pyimpl(with(Callable, Constructor))]
+    #[pyclass(with(Callable, Constructor))]
     impl PyItemGetter {
         #[pymethod(magic)]
         fn repr(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<String> {
             let fmt = if let Some(_guard) = ReprGuard::enter(vm, zelf.as_object()) {
                 let mut items = Vec::with_capacity(zelf.items.len());
-                for item in zelf.items.iter() {
+                for item in &zelf.items {
                     items.push(item.repr(vm)?.as_str().to_owned());
                 }
                 items.join(", ")
@@ -545,7 +545,7 @@ mod _operator {
         #[pymethod(magic)]
         fn reduce(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyObjectRef {
             let items = vm.ctx.new_tuple(zelf.items.to_vec());
-            vm.new_pyobj((zelf.clone_class(), items))
+            vm.new_pyobj((zelf.class().clone(), items))
         }
     }
     impl Constructor for PyItemGetter {
@@ -559,21 +559,23 @@ mod _operator {
             if args.args.is_empty() {
                 return Err(vm.new_type_error("itemgetter expected 1 argument, got 0.".to_owned()));
             }
-            PyItemGetter { items: args.args }.into_pyresult_with_type(vm, cls)
+            PyItemGetter { items: args.args }
+                .into_ref_with_type(vm, cls)
+                .map(Into::into)
         }
     }
 
     impl Callable for PyItemGetter {
         type Args = PyObjectRef;
-        fn call(zelf: &PyObjectView<Self>, obj: Self::Args, vm: &VirtualMachine) -> PyResult {
+        fn call(zelf: &Py<Self>, obj: Self::Args, vm: &VirtualMachine) -> PyResult {
             // Handle case where we only have one attribute.
             if zelf.items.len() == 1 {
-                return obj.get_item(zelf.items[0].clone(), vm);
+                return obj.get_item(&*zelf.items[0], vm);
             }
             // Build tuple and call get_single on each element in attrs.
             let mut results = Vec::with_capacity(zelf.items.len());
-            for item in zelf.items.iter() {
-                results.push(obj.get_item(item.clone(), vm)?);
+            for item in &zelf.items {
+                results.push(obj.get_item(&**item, vm)?);
             }
             Ok(vm.ctx.new_tuple(results).into())
         }
@@ -587,13 +589,13 @@ mod _operator {
     /// r.name('date', foo=1).
     #[pyattr]
     #[pyclass(name = "methodcaller")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct PyMethodCaller {
         name: PyStrRef,
         args: FuncArgs,
     }
 
-    #[pyimpl(with(Callable, Constructor))]
+    #[pyclass(with(Callable, Constructor))]
     impl PyMethodCaller {
         #[pymethod(magic)]
         fn repr(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<String> {
@@ -630,7 +632,7 @@ mod _operator {
             if zelf.args.kwargs.is_empty() {
                 let mut pargs = vec![zelf.name.as_object().to_owned()];
                 pargs.append(&mut zelf.args.args.clone());
-                Ok(vm.new_tuple((zelf.clone_class(), vm.ctx.new_tuple(pargs))))
+                Ok(vm.new_tuple((zelf.class().clone(), vm.ctx.new_tuple(pargs))))
             } else {
                 // If we have kwargs, create a partial function that contains them and pass back that
                 // along with the args.
@@ -638,7 +640,7 @@ mod _operator {
                 let callable = vm.invoke(
                     &partial,
                     FuncArgs::new(
-                        vec![zelf.clone_class().into(), zelf.name.as_object().to_owned()],
+                        vec![zelf.class().clone().into(), zelf.name.clone().into()],
                         KwArgs::new(zelf.args.kwargs.clone()),
                     ),
                 )?;
@@ -652,7 +654,9 @@ mod _operator {
 
         fn py_new(cls: PyTypeRef, (name, args): Self::Args, vm: &VirtualMachine) -> PyResult {
             if let Ok(name) = name.try_into_value(vm) {
-                PyMethodCaller { name, args }.into_pyresult_with_type(vm, cls)
+                PyMethodCaller { name, args }
+                    .into_ref_with_type(vm, cls)
+                    .map(Into::into)
             } else {
                 Err(vm.new_type_error("method name must be a string".to_owned()))
             }
@@ -663,7 +667,7 @@ mod _operator {
         type Args = PyObjectRef;
 
         #[inline]
-        fn call(zelf: &PyObjectView<Self>, obj: Self::Args, vm: &VirtualMachine) -> PyResult {
+        fn call(zelf: &Py<Self>, obj: Self::Args, vm: &VirtualMachine) -> PyResult {
             vm.call_method(&obj, zelf.name.as_str(), zelf.args.clone())
         }
     }

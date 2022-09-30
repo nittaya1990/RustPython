@@ -3,14 +3,46 @@
  */
 cfg_if::cfg_if! {
     if #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))] {
-        use crate::crt_fd::Offset;
+        use crate::common::crt_fd::Offset;
     } else {
         type Offset = i64;
     }
 }
 
-use crate::{PyObjectRef, PyResult, TryFromObject, VirtualMachine};
-pub(crate) use _io::io_open as open;
+use crate::{
+    builtins::PyBaseExceptionRef,
+    convert::{IntoPyException, ToPyException, ToPyObject},
+    PyObjectRef, PyResult, TryFromObject, VirtualMachine,
+};
+pub use _io::io_open as open;
+
+impl ToPyException for std::io::Error {
+    fn to_pyexception(&self, vm: &VirtualMachine) -> PyBaseExceptionRef {
+        use std::io::ErrorKind;
+
+        let excs = &vm.ctx.exceptions;
+        #[allow(unreachable_patterns)] // some errors are just aliases of each other
+        let exc_type = match self.kind() {
+            ErrorKind::NotFound => excs.file_not_found_error,
+            ErrorKind::PermissionDenied => excs.permission_error,
+            ErrorKind::AlreadyExists => excs.file_exists_error,
+            ErrorKind::WouldBlock => excs.blocking_io_error,
+            _ => self
+                .raw_os_error()
+                .and_then(|errno| crate::exceptions::raw_os_error_to_exc_type(errno, vm))
+                .unwrap_or(excs.os_error),
+        };
+        let errno = self.raw_os_error().to_pyobject(vm);
+        let msg = vm.ctx.new_str(self.to_string()).into();
+        vm.new_exception(exc_type.to_owned(), vec![errno, msg])
+    }
+}
+
+impl IntoPyException for std::io::Error {
+    fn into_pyexception(self, vm: &VirtualMachine) -> PyBaseExceptionRef {
+        self.to_pyexception(vm)
+    }
+}
 
 pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
     let ctx = &vm.ctx;
@@ -25,7 +57,7 @@ pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
         .clone();
     extend_module!(vm, module, {
         "UnsupportedOperation" => unsupported_operation,
-        "BlockingIOError" => ctx.exceptions.blocking_io_error.clone(),
+        "BlockingIOError" => ctx.exceptions.blocking_io_error.to_owned(),
     });
 
     module
@@ -73,28 +105,32 @@ mod _io {
             PyBaseExceptionRef, PyByteArray, PyBytes, PyBytesRef, PyIntRef, PyMemoryView, PyStr,
             PyStrRef, PyType, PyTypeRef,
         },
+        class::StaticType,
         common::lock::{
             PyMappedThreadMutexGuard, PyRwLock, PyRwLockReadGuard, PyRwLockWriteGuard,
             PyThreadMutex, PyThreadMutexGuard,
         },
+        convert::ToPyObject,
         function::{
-            ArgBytesLike, ArgIterable, ArgMemoryBuffer, FuncArgs, IntoPyObject, OptionalArg,
-            OptionalOption,
+            ArgBytesLike, ArgIterable, ArgMemoryBuffer, Either, FuncArgs, OptionalArg,
+            OptionalOption, PySetterValue,
         },
         protocol::{
             BufferDescriptor, BufferMethods, BufferResizeGuard, PyBuffer, PyIterReturn, VecBuffer,
         },
-        types::{Constructor, Destructor, IterNext, Iterable},
-        utils::Either,
-        vm::{ReprGuard, VirtualMachine},
-        IdProtocol, PyContext, PyObject, PyObjectRef, PyObjectWrap, PyRef, PyResult, PyValue,
-        StaticType, TryFromBorrowedObject, TryFromObject, TypeProtocol,
+        recursion::ReprGuard,
+        types::{Constructor, DefaultConstructor, Destructor, Initializer, IterNext, Iterable},
+        vm::VirtualMachine,
+        AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
+        TryFromBorrowedObject, TryFromObject,
     };
     use bstr::ByteSlice;
     use crossbeam_utils::atomic::AtomicCell;
     use num_traits::ToPrimitive;
-    use std::io::{self, prelude::*, Cursor, SeekFrom};
-    use std::ops::Range;
+    use std::{
+        io::{self, prelude::*, Cursor, SeekFrom},
+        ops::Range,
+    };
 
     #[allow(clippy::let_and_return)]
     fn validate_whence(whence: i32) -> bool {
@@ -136,6 +172,7 @@ mod _io {
     }
 
     impl OptionalSize {
+        #[allow(clippy::wrong_self_convention)]
         pub fn to_usize(self) -> Option<usize> {
             self.size.and_then(|v| v.to_usize())
         }
@@ -156,8 +193,8 @@ mod _io {
     fn os_err(vm: &VirtualMachine, err: io::Error) -> PyBaseExceptionRef {
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         {
-            use crate::function::IntoPyException;
-            err.into_pyexception(vm)
+            use crate::convert::ToPyException;
+            err.to_pyexception(vm)
         }
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         {
@@ -270,8 +307,8 @@ mod _io {
                 }
             };
             let buf = match available.find_byte(byte) {
-                Some(i) => (available[..=i].to_vec()),
-                _ => (available.to_vec()),
+                Some(i) => available[..=i].to_vec(),
+                _ => available.to_vec(),
             };
             self.cursor.consume(buf.len());
             Ok(buf)
@@ -339,10 +376,10 @@ mod _io {
 
     #[pyattr]
     #[pyclass(name = "_IOBase")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct _IOBase;
 
-    #[pyimpl(with(IterNext, Destructor), flags(BASETYPE, HAS_DICT))]
+    #[pyclass(with(IterNext, Destructor), flags(BASETYPE, HAS_DICT))]
     impl _IOBase {
         #[pymethod]
         fn seek(
@@ -367,7 +404,7 @@ mod _io {
         }
 
         #[pyattr]
-        fn __closed(ctx: &PyContext) -> PyIntRef {
+        fn __closed(ctx: &Context) -> PyIntRef {
             ctx.new_bool(false)
         }
 
@@ -407,7 +444,7 @@ mod _io {
             false
         }
 
-        #[pyproperty]
+        #[pygetset]
         fn closed(instance: PyObjectRef, vm: &VirtualMachine) -> PyResult {
             instance.get_attr("__closed", vm)
         }
@@ -447,7 +484,7 @@ mod _io {
         ) -> PyResult<Vec<PyObjectRef>> {
             let hint = hint.flatten().unwrap_or(-1);
             if hint <= 0 {
-                return vm.extract_elements(&instance);
+                return instance.try_to_value(vm);
             }
             let hint = hint as usize;
             let mut ret = Vec::new();
@@ -506,7 +543,7 @@ mod _io {
         }
 
         #[cold]
-        fn del(_zelf: &crate::PyObjectView<Self>, _vm: &VirtualMachine) -> PyResult<()> {
+        fn del(_zelf: &crate::Py<Self>, _vm: &VirtualMachine) -> PyResult<()> {
             unreachable!("slot_del is implemented")
         }
     }
@@ -532,7 +569,7 @@ mod _io {
             })
         }
 
-        fn next(_zelf: &crate::PyObjectView<Self>, _vm: &VirtualMachine) -> PyResult<PyIterReturn> {
+        fn next(_zelf: &crate::Py<Self>, _vm: &VirtualMachine) -> PyResult<PyIterReturn> {
             unreachable!("slot_iternext is implemented")
         }
     }
@@ -550,7 +587,7 @@ mod _io {
     #[pyclass(name = "_RawIOBase", base = "_IOBase")]
     pub(super) struct _RawIOBase;
 
-    #[pyimpl(flags(BASETYPE, HAS_DICT))]
+    #[pyclass(flags(BASETYPE, HAS_DICT))]
     impl _RawIOBase {
         #[pymethod]
         fn read(instance: PyObjectRef, size: OptionalSize, vm: &VirtualMachine) -> PyResult {
@@ -567,7 +604,7 @@ mod _io {
                     // FIXME: try to use Arc::unwrap on the bytearray to get at the inner buffer
                     bytes.clone()
                 })
-                .into_pyobject(vm))
+                .to_pyobject(vm))
             } else {
                 vm.call_method(&instance, "readall", ())
             }
@@ -608,7 +645,7 @@ mod _io {
     #[pyclass(name = "_BufferedIOBase", base = "_IOBase")]
     struct _BufferedIOBase;
 
-    #[pyimpl(flags(BASETYPE))]
+    #[pyclass(flags(BASETYPE))]
     impl _BufferedIOBase {
         #[pymethod]
         fn read(zelf: PyObjectRef, _size: OptionalArg, vm: &VirtualMachine) -> PyResult {
@@ -664,10 +701,16 @@ mod _io {
     // TextIO Base has no public constructor
     #[pyattr]
     #[pyclass(name = "_TextIOBase", base = "_IOBase")]
+    #[derive(Debug, PyPayload)]
     struct _TextIOBase;
 
-    #[pyimpl(flags(BASETYPE))]
-    impl _TextIOBase {}
+    #[pyclass(flags(BASETYPE))]
+    impl _TextIOBase {
+        #[pygetset]
+        fn encoding(_zelf: PyObjectRef, vm: &VirtualMachine) -> PyObjectRef {
+            vm.ctx.none()
+        }
+    }
 
     #[derive(FromArgs, Clone)]
     struct BufferSize {
@@ -771,7 +814,7 @@ mod _io {
                     self.raw_write(None, self.write_pos as usize..self.write_end as usize, vm)?;
                 let n = n.ok_or_else(|| {
                     vm.new_exception_msg(
-                        vm.ctx.exceptions.blocking_io_error.clone(),
+                        vm.ctx.exceptions.blocking_io_error.to_owned(),
                         "write could not complete without blocking".to_owned(),
                     )
                 })?;
@@ -869,7 +912,7 @@ mod _io {
         ) -> PyResult<Option<usize>> {
             let len = buf_range.len();
             let res = if let Some(buf) = buf {
-                let memobj = PyMemoryView::from_buffer_range(buf, buf_range, vm)?.into_pyobject(vm);
+                let memobj = PyMemoryView::from_buffer_range(buf, buf_range, vm)?.to_pyobject(vm);
 
                 // TODO: loop if write() raises an interrupt
                 vm.call_method(self.raw.as_ref().unwrap(), "write", (memobj,))?
@@ -969,7 +1012,7 @@ mod _io {
                             // TODO: BlockingIOError(errno, msg, written)
                             // written += self.buffer.len();
                             return Err(vm.new_exception_msg(
-                                vm.ctx.exceptions.blocking_io_error.clone(),
+                                vm.ctx.exceptions.blocking_io_error.to_owned(),
                                 "write could not complete without blocking".to_owned(),
                             ));
                         } else {
@@ -1155,7 +1198,7 @@ mod _io {
             }
 
             let readall = vm
-                .get_method(self.raw.clone().unwrap(), "readall")
+                .get_str_method(self.raw.clone().unwrap(), "readall")
                 .transpose()?;
             if let Some(readall) = readall {
                 let res = vm.invoke(&readall, ())?;
@@ -1249,7 +1292,7 @@ mod _io {
                 }
             }
             if self.writable() {
-                let _ = self.flush_rewind(vm)?;
+                self.flush_rewind(vm)?;
             }
             self.reset_read();
             self.pos = 0;
@@ -1293,7 +1336,7 @@ mod _io {
     }
 
     pub fn get_offset(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<Offset> {
-        let int = vm.to_index(&obj)?;
+        let int = obj.try_index(vm)?;
         int.as_bigint().try_into().map_err(|_| {
             vm.new_value_error(format!(
                 "cannot fit '{}' into an offset-sized integer",
@@ -1306,8 +1349,8 @@ mod _io {
         let name = match obj.to_owned().get_attr("name", vm) {
             Ok(name) => Some(name),
             Err(e)
-                if e.isinstance(&vm.ctx.exceptions.attribute_error)
-                    || e.isinstance(&vm.ctx.exceptions.value_error) =>
+                if e.fast_isinstance(vm.ctx.exceptions.attribute_error)
+                    || e.fast_isinstance(vm.ctx.exceptions.value_error) =>
             {
                 None
             }
@@ -1328,8 +1371,9 @@ mod _io {
         }
     }
 
-    #[pyimpl]
-    trait BufferedMixin: PyValue {
+    #[pyclass]
+    trait BufferedMixin: PyPayload {
+        const CLASS_NAME: &'static str;
         const READABLE: bool;
         const WRITABLE: bool;
         const SEEKABLE: bool = false;
@@ -1338,6 +1382,17 @@ mod _io {
             self.data()
                 .lock()
                 .ok_or_else(|| vm.new_runtime_error("reentrant call inside buffered io".to_owned()))
+        }
+
+        #[pyslot]
+        fn slot_init(zelf: PyObjectRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult<()> {
+            let zelf: PyRef<Self> = zelf.try_into_value(vm)?;
+            let (raw, BufferSize { buffer_size }): (PyObjectRef, _) =
+                args.bind(vm).map_err(|e| {
+                    let msg = format!("{}() {}", Self::CLASS_NAME, *e.str(vm));
+                    vm.new_exception_msg(e.class().clone(), msg)
+                })?;
+            zelf.init(raw, BufferSize { buffer_size }, vm)
         }
 
         #[pymethod(magic)]
@@ -1418,7 +1473,7 @@ mod _io {
             pos: OptionalOption<PyObjectRef>,
             vm: &VirtualMachine,
         ) -> PyResult {
-            let pos = pos.flatten().into_pyobject(vm);
+            let pos = pos.flatten().to_pyobject(vm);
             let mut data = zelf.lock(vm)?;
             data.check_init(vm)?;
             if data.writable() {
@@ -1441,25 +1496,25 @@ mod _io {
         fn seekable(&self, vm: &VirtualMachine) -> PyResult {
             vm.call_method(self.lock(vm)?.check_init(vm)?, "seekable", ())
         }
-        #[pyproperty]
+        #[pygetset]
         fn raw(&self, vm: &VirtualMachine) -> PyResult<Option<PyObjectRef>> {
             Ok(self.lock(vm)?.raw.clone())
         }
-        #[pyproperty]
+        #[pygetset]
         fn closed(&self, vm: &VirtualMachine) -> PyResult {
             self.lock(vm)?
                 .check_init(vm)?
                 .to_owned()
                 .get_attr("closed", vm)
         }
-        #[pyproperty]
+        #[pygetset]
         fn name(&self, vm: &VirtualMachine) -> PyResult {
             self.lock(vm)?
                 .check_init(vm)?
                 .to_owned()
                 .get_attr("name", vm)
         }
-        #[pyproperty]
+        #[pygetset]
         fn mode(&self, vm: &VirtualMachine) -> PyResult {
             self.lock(vm)?
                 .check_init(vm)?
@@ -1531,8 +1586,8 @@ mod _io {
         }
     }
 
-    #[pyimpl]
-    trait BufferedReadable: PyValue {
+    #[pyclass]
+    trait BufferedReadable: PyPayload {
         type Reader: BufferedMixin;
         fn reader(&self) -> &Self::Reader;
         #[pymethod]
@@ -1567,7 +1622,7 @@ mod _io {
             let mut data = self.reader().lock(vm)?;
             let raw = data.check_init(vm)?;
             ensure_unclosed(raw, "read of closed file", vm)?;
-            let n = size.to_usize().unwrap_or_else(|| data.buffer.len());
+            let n = size.to_usize().unwrap_or(data.buffer.len());
             if n == 0 {
                 return Ok(Vec::new());
             }
@@ -1614,11 +1669,12 @@ mod _io {
 
     #[pyattr]
     #[pyclass(name = "BufferedReader", base = "_BufferedIOBase")]
-    #[derive(Debug, Default, PyValue)]
+    #[derive(Debug, Default, PyPayload)]
     struct BufferedReader {
         data: PyThreadMutex<BufferedData>,
     }
     impl BufferedMixin for BufferedReader {
+        const CLASS_NAME: &'static str = "BufferedReader";
         const READABLE: bool = true;
         const WRITABLE: bool = false;
         fn data(&self) -> &PyThreadMutex<BufferedData> {
@@ -1632,16 +1688,16 @@ mod _io {
         }
     }
 
-    #[pyimpl(with(BufferedMixin, BufferedReadable), flags(BASETYPE, HAS_DICT))]
-    impl BufferedReader {
-        #[pyslot]
-        fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-            Self::default().into_pyresult_with_type(vm, cls)
-        }
-    }
+    #[pyclass(
+        with(DefaultConstructor, BufferedMixin, BufferedReadable),
+        flags(BASETYPE, HAS_DICT)
+    )]
+    impl BufferedReader {}
 
-    #[pyimpl]
-    trait BufferedWritable: PyValue {
+    impl DefaultConstructor for BufferedReader {}
+
+    #[pyclass]
+    trait BufferedWritable: PyPayload {
         type Writer: BufferedMixin;
         fn writer(&self) -> &Self::Writer;
         #[pymethod]
@@ -1663,11 +1719,12 @@ mod _io {
 
     #[pyattr]
     #[pyclass(name = "BufferedWriter", base = "_BufferedIOBase")]
-    #[derive(Debug, Default, PyValue)]
+    #[derive(Debug, Default, PyPayload)]
     struct BufferedWriter {
         data: PyThreadMutex<BufferedData>,
     }
     impl BufferedMixin for BufferedWriter {
+        const CLASS_NAME: &'static str = "BufferedWriter";
         const READABLE: bool = false;
         const WRITABLE: bool = true;
         fn data(&self) -> &PyThreadMutex<BufferedData> {
@@ -1681,21 +1738,22 @@ mod _io {
         }
     }
 
-    #[pyimpl(with(BufferedMixin, BufferedWritable), flags(BASETYPE, HAS_DICT))]
-    impl BufferedWriter {
-        #[pyslot]
-        fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-            Self::default().into_pyresult_with_type(vm, cls)
-        }
-    }
+    #[pyclass(
+        with(DefaultConstructor, BufferedMixin, BufferedWritable),
+        flags(BASETYPE, HAS_DICT)
+    )]
+    impl BufferedWriter {}
+
+    impl DefaultConstructor for BufferedWriter {}
 
     #[pyattr]
     #[pyclass(name = "BufferedRandom", base = "_BufferedIOBase")]
-    #[derive(Debug, Default, PyValue)]
+    #[derive(Debug, Default, PyPayload)]
     struct BufferedRandom {
         data: PyThreadMutex<BufferedData>,
     }
     impl BufferedMixin for BufferedRandom {
+        const CLASS_NAME: &'static str = "BufferedRandom";
         const READABLE: bool = true;
         const WRITABLE: bool = true;
         const SEEKABLE: bool = true;
@@ -1716,20 +1774,17 @@ mod _io {
         }
     }
 
-    #[pyimpl(
-        with(BufferedMixin, BufferedReadable, BufferedWritable),
+    #[pyclass(
+        with(DefaultConstructor, BufferedMixin, BufferedReadable, BufferedWritable),
         flags(BASETYPE, HAS_DICT)
     )]
-    impl BufferedRandom {
-        #[pyslot]
-        fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-            Self::default().into_pyresult_with_type(vm, cls)
-        }
-    }
+    impl BufferedRandom {}
+
+    impl DefaultConstructor for BufferedRandom {}
 
     #[pyattr]
     #[pyclass(name = "BufferedRWPair", base = "_BufferedIOBase")]
-    #[derive(Debug, Default, PyValue)]
+    #[derive(Debug, Default, PyPayload)]
     struct BufferedRWPair {
         read: BufferedReader,
         write: BufferedWriter,
@@ -1746,25 +1801,28 @@ mod _io {
             &self.write
         }
     }
-    #[pyimpl(with(BufferedReadable, BufferedWritable), flags(BASETYPE, HAS_DICT))]
-    impl BufferedRWPair {
-        #[pyslot]
-        fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-            Self::default().into_pyresult_with_type(vm, cls)
-        }
-        #[pymethod(magic)]
+
+    impl DefaultConstructor for BufferedRWPair {}
+
+    impl Initializer for BufferedRWPair {
+        type Args = (PyObjectRef, PyObjectRef, BufferSize);
+
         fn init(
-            &self,
-            reader: PyObjectRef,
-            writer: PyObjectRef,
-            buffer_size: BufferSize,
+            zelf: PyRef<Self>,
+            (reader, writer, buffer_size): Self::Args,
             vm: &VirtualMachine,
         ) -> PyResult<()> {
-            self.read.init(reader, buffer_size.clone(), vm)?;
-            self.write.init(writer, buffer_size, vm)?;
+            zelf.read.init(reader, buffer_size.clone(), vm)?;
+            zelf.write.init(writer, buffer_size, vm)?;
             Ok(())
         }
+    }
 
+    #[pyclass(
+        with(DefaultConstructor, Initializer, BufferedReadable, BufferedWritable),
+        flags(BASETYPE, HAS_DICT)
+    )]
+    impl BufferedRWPair {
         #[pymethod]
         fn flush(&self, vm: &VirtualMachine) -> PyResult<()> {
             self.write.flush(vm)
@@ -1779,7 +1837,7 @@ mod _io {
             true
         }
 
-        #[pyproperty]
+        #[pygetset]
         fn closed(&self, vm: &VirtualMachine) -> PyResult {
             self.write.closed(vm)
         }
@@ -2136,35 +2194,18 @@ mod _io {
 
     #[pyattr]
     #[pyclass(name = "TextIOWrapper", base = "_TextIOBase")]
-    #[derive(Debug, Default, PyValue)]
+    #[derive(Debug, Default, PyPayload)]
     struct TextIOWrapper {
         data: PyThreadMutex<Option<TextIOData>>,
     }
 
-    #[pyimpl(flags(BASETYPE))]
-    impl TextIOWrapper {
-        #[pyslot]
-        fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-            Self::default().into_pyresult_with_type(vm, cls)
-        }
+    impl DefaultConstructor for TextIOWrapper {}
 
-        fn lock_opt(
-            &self,
-            vm: &VirtualMachine,
-        ) -> PyResult<PyThreadMutexGuard<Option<TextIOData>>> {
-            self.data
-                .lock()
-                .ok_or_else(|| vm.new_runtime_error("reentrant call inside textio".to_owned()))
-        }
-        fn lock(&self, vm: &VirtualMachine) -> PyResult<PyMappedThreadMutexGuard<TextIOData>> {
-            let lock = self.lock_opt(vm)?;
-            PyThreadMutexGuard::try_map(lock, |x| x.as_mut())
-                .map_err(|_| vm.new_value_error("I/O operation on uninitialized object".to_owned()))
-        }
+    impl Initializer for TextIOWrapper {
+        type Args = TextIOWrapperArgs;
 
-        #[pymethod(magic)]
-        fn init(&self, args: TextIOWrapperArgs, vm: &VirtualMachine) -> PyResult<()> {
-            let mut data = self.lock_opt(vm)?;
+        fn init(zelf: PyRef<Self>, args: Self::Args, vm: &VirtualMachine) -> PyResult<()> {
+            let mut data = zelf.lock_opt(vm)?;
             *data = None;
 
             let encoding = match args.encoding {
@@ -2234,7 +2275,27 @@ mod _io {
 
             Ok(())
         }
+    }
 
+    impl TextIOWrapper {
+        fn lock_opt(
+            &self,
+            vm: &VirtualMachine,
+        ) -> PyResult<PyThreadMutexGuard<Option<TextIOData>>> {
+            self.data
+                .lock()
+                .ok_or_else(|| vm.new_runtime_error("reentrant call inside textio".to_owned()))
+        }
+
+        fn lock(&self, vm: &VirtualMachine) -> PyResult<PyMappedThreadMutexGuard<TextIOData>> {
+            let lock = self.lock_opt(vm)?;
+            PyThreadMutexGuard::try_map(lock, |x| x.as_mut())
+                .map_err(|_| vm.new_value_error("I/O operation on uninitialized object".to_owned()))
+        }
+    }
+
+    #[pyclass(with(DefaultConstructor, Initializer), flags(BASETYPE))]
+    impl TextIOWrapper {
         #[pymethod]
         fn seekable(&self, vm: &VirtualMachine) -> PyResult {
             let textio = self.lock(vm)?;
@@ -2251,15 +2312,27 @@ mod _io {
             vm.call_method(&textio.buffer, "writable", ())
         }
 
-        #[pyproperty(name = "_CHUNK_SIZE")]
+        #[pygetset(name = "_CHUNK_SIZE")]
         fn chunksize(&self, vm: &VirtualMachine) -> PyResult<usize> {
             Ok(self.lock(vm)?.chunk_size)
         }
 
-        #[pyproperty(setter, name = "_CHUNK_SIZE")]
-        fn set_chunksize(&self, chunk_size: usize, vm: &VirtualMachine) -> PyResult<()> {
+        #[pygetset(setter, name = "_CHUNK_SIZE")]
+        fn set_chunksize(
+            &self,
+            chunk_size: PySetterValue<usize>,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
             let mut textio = self.lock(vm)?;
-            textio.chunk_size = chunk_size;
+            match chunk_size {
+                PySetterValue::Assign(chunk_size) => textio.chunk_size = chunk_size,
+                PySetterValue::Delete => {
+                    Err(vm.new_attribute_error("cannot delete attribute".to_owned()))?
+                }
+            };
+            // TODO: RUSTPYTHON
+            // Change chunk_size type, validate it manually and throws ValueError if invalid.
+            // https://github.com/python/cpython/blob/2e9da8e3522764d09f1d6054a2be567e91a30812/Modules/_io/textio.c#L3124-L3143
             Ok(())
         }
 
@@ -2416,7 +2489,7 @@ mod _io {
                 ..Default::default()
             };
             if textio.decoded_chars_used.bytes == 0 {
-                return Ok(cookie.build().into_pyobject(vm));
+                return Ok(cookie.build().to_pyobject(vm));
             }
             let decoder_getstate = || {
                 let state = vm.call_method(decoder, "getstate", ())?;
@@ -2495,19 +2568,19 @@ mod _io {
             }
             vm.call_method(decoder, "setstate", (saved_state,))?;
             cookie.set_num_to_skip(num_to_skip);
-            Ok(cookie.build().into_pyobject(vm))
+            Ok(cookie.build().to_pyobject(vm))
         }
 
-        #[pyproperty]
+        #[pygetset]
         fn name(&self, vm: &VirtualMachine) -> PyResult {
             let buffer = self.lock(vm)?.buffer.clone();
             buffer.get_attr("name", vm)
         }
-        #[pyproperty]
+        #[pygetset]
         fn encoding(&self, vm: &VirtualMachine) -> PyResult<PyStrRef> {
             Ok(self.lock(vm)?.encoding.clone())
         }
-        #[pyproperty]
+        #[pygetset]
         fn errors(&self, vm: &VirtualMachine) -> PyResult<PyStrRef> {
             Ok(self.lock(vm)?.errors.clone())
         }
@@ -2547,7 +2620,7 @@ mod _io {
                     }
                 }
                 if chunks.is_empty() {
-                    PyStr::from("").into_ref(vm)
+                    vm.ctx.empty_str.clone()
                 } else if chunks.len() == 1 {
                     chunks.pop().unwrap()
                 } else {
@@ -2809,7 +2882,7 @@ mod _io {
             } else if let Some(cur_line) = cur_line {
                 cur_line.slice_pystr(vm)
             } else {
-                PyStr::from("").into_ref(vm)
+                vm.ctx.empty_str.clone()
             };
             Ok(line)
         }
@@ -2824,12 +2897,12 @@ mod _io {
             let close_res = vm.call_method(&buffer, "close", ()).map(drop);
             exeption_chain(flush_res, close_res)
         }
-        #[pyproperty]
+        #[pygetset]
         fn closed(&self, vm: &VirtualMachine) -> PyResult {
             let buffer = self.lock(vm)?.buffer.clone();
             buffer.get_attr("closed", vm)
         }
-        #[pyproperty]
+        #[pygetset]
         fn buffer(&self, vm: &VirtualMachine) -> PyResult {
             Ok(self.lock(vm)?.buffer.clone())
         }
@@ -2916,7 +2989,7 @@ mod _io {
             if let Some((dec_buffer, dec_flags)) = dec_state {
                 // TODO: inplace append to bytes when refcount == 1
                 let mut next_input = dec_buffer.as_bytes().to_vec();
-                next_input.extend_from_slice(&*buf.borrow_buf());
+                next_input.extend_from_slice(&buf.borrow_buf());
                 self.snapshot = Some((dec_flags, PyBytes::from(next_input).into_ref(vm)));
             }
 
@@ -2968,7 +3041,7 @@ mod _io {
             append: Option<PyStrRef>,
             vm: &VirtualMachine,
         ) -> PyStrRef {
-            let empty_str = || PyStr::from("").into_ref(vm);
+            let empty_str = || vm.ctx.empty_str.clone();
             let chars_pos = std::mem::take(&mut self.decoded_chars_used).bytes;
             let decoded_chars = match std::mem::take(&mut self.decoded_chars) {
                 None => return append.unwrap_or_else(empty_str),
@@ -2992,7 +3065,7 @@ mod _io {
 
     #[pyattr]
     #[pyclass(name = "StringIO", base = "_TextIOBase")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct StringIO {
         buffer: PyRwLock<BufferedIO>,
         closed: AtomicCell<bool>,
@@ -3028,11 +3101,12 @@ mod _io {
                 buffer: PyRwLock::new(BufferedIO::new(Cursor::new(raw_bytes))),
                 closed: AtomicCell::new(false),
             }
-            .into_pyresult_with_type(vm, cls)
+            .into_ref_with_type(vm, cls)
+            .map(Into::into)
         }
     }
 
-    #[pyimpl(flags(BASETYPE, HAS_DICT), with(PyRef, Constructor))]
+    #[pyclass(flags(BASETYPE, HAS_DICT), with(PyRef, Constructor))]
     impl StringIO {
         fn buffer(&self, vm: &VirtualMachine) -> PyResult<PyRwLockWriteGuard<'_, BufferedIO>> {
             if !self.closed.load() {
@@ -3055,7 +3129,7 @@ mod _io {
             true
         }
 
-        #[pyproperty]
+        #[pygetset]
         fn closed(&self) -> bool {
             self.closed.load()
         }
@@ -3066,7 +3140,7 @@ mod _io {
         }
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl StringIORef {
         //write string to underlying vector
         #[pymethod]
@@ -3141,7 +3215,7 @@ mod _io {
 
     #[pyattr]
     #[pyclass(name = "BytesIO", base = "_BufferedIOBase")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     struct BytesIO {
         buffer: PyRwLock<BufferedIO>,
         closed: AtomicCell<bool>,
@@ -3163,11 +3237,12 @@ mod _io {
                 closed: AtomicCell::new(false),
                 exports: AtomicCell::new(0),
             }
-            .into_pyresult_with_type(vm, cls)
+            .into_ref_with_type(vm, cls)
+            .map(Into::into)
         }
     }
 
-    #[pyimpl(flags(BASETYPE, HAS_DICT), with(PyRef, Constructor))]
+    #[pyclass(flags(BASETYPE, HAS_DICT), with(PyRef, Constructor))]
     impl BytesIO {
         fn buffer(&self, vm: &VirtualMachine) -> PyResult<PyRwLockWriteGuard<'_, BufferedIO>> {
             if !self.closed.load() {
@@ -3191,7 +3266,7 @@ mod _io {
         }
     }
 
-    #[pyimpl]
+    #[pyclass]
     impl BytesIORef {
         #[pymethod]
         fn write(self, data: ArgBytesLike, vm: &VirtualMachine) -> PyResult<u64> {
@@ -3214,10 +3289,7 @@ mod _io {
         #[pymethod]
         #[pymethod(name = "read1")]
         fn read(self, size: OptionalSize, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
-            let buf = self
-                .buffer(vm)?
-                .read(size.to_usize())
-                .unwrap_or_else(Vec::new);
+            let buf = self.buffer(vm)?.read(size.to_usize()).unwrap_or_default();
             Ok(buf)
         }
 
@@ -3226,7 +3298,7 @@ mod _io {
             let mut buf = self.buffer(vm)?;
             let ret = buf
                 .cursor
-                .read(&mut *obj.borrow_buf_mut())
+                .read(&mut obj.borrow_buf_mut())
                 .map_err(|_| vm.new_value_error("Error readinto from Take".to_owned()))?;
 
             Ok(ret)
@@ -3270,14 +3342,14 @@ mod _io {
             Ok(buffer.truncate(pos))
         }
 
-        #[pyproperty]
+        #[pygetset]
         fn closed(self) -> bool {
             self.closed.load()
         }
 
         #[pymethod]
         fn close(self, vm: &VirtualMachine) -> PyResult<()> {
-            let _ = self.try_resizable(vm)?;
+            drop(self.try_resizable(vm)?);
             self.closed.store(true);
             Ok(())
         }
@@ -3286,7 +3358,7 @@ mod _io {
         fn getbuffer(self, vm: &VirtualMachine) -> PyResult<PyMemoryView> {
             let len = self.buffer.read().cursor.get_ref().len();
             let buffer = PyBuffer::new(
-                self.into_object(),
+                self.into(),
                 BufferDescriptor::simple(len, false),
                 &BYTES_IO_BUFFER_METHODS,
             );
@@ -3318,14 +3390,9 @@ mod _io {
     impl<'a> BufferResizeGuard<'a> for BytesIO {
         type Resizable = PyRwLockWriteGuard<'a, BufferedIO>;
 
-        fn try_resizable(&'a self, vm: &VirtualMachine) -> PyResult<Self::Resizable> {
-            if self.exports.load() == 0 {
-                Ok(self.buffer.write())
-            } else {
-                Err(vm.new_buffer_error(
-                    "Existing exports of data: object cannot be re-sized".to_owned(),
-                ))
-            }
+        fn try_resizable_opt(&'a self) -> Option<Self::Resizable> {
+            let w = self.buffer.write();
+            (self.exports.load() == 0).then_some(w)
         }
     }
 
@@ -3512,7 +3579,7 @@ mod _io {
 
         // Construct a FileIO (subclass of RawIOBase)
         // This is subsequently consumed by a Buffered Class.
-        let file_io_class = {
+        let file_io_class: &Py<PyType> = {
             cfg_if::cfg_if! {
                 if #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))] {
                     Some(super::fileio::FileIO::static_type())
@@ -3520,15 +3587,15 @@ mod _io {
                     None
                 }
             }
-        };
-        let file_io_class: &PyTypeRef = file_io_class.ok_or_else(|| {
+        }
+        .ok_or_else(|| {
             new_unsupported_operation(
                 vm,
                 "Couldn't get FileIO, io.open likely isn't supported on your platform".to_owned(),
             )
         })?;
         let raw = vm.invoke(
-            file_io_class.as_object(),
+            file_io_class,
             (file, mode.rawmode(), opts.closefd, opts.opener),
         )?;
 
@@ -3562,13 +3629,13 @@ mod _io {
         } else {
             BufferedWriter::static_type()
         };
-        let buffered = vm.invoke(cls.as_object(), (raw, buffering))?;
+        let buffered = vm.invoke(cls, (raw, buffering))?;
 
         match mode.encode {
             EncodeMode::Text => {
                 let tio = TextIOWrapper::static_type();
                 let wrapper = vm.invoke(
-                    tio.as_object(),
+                    tio,
                     (
                         buffered,
                         opts.encoding,
@@ -3588,18 +3655,31 @@ mod _io {
         pub(super) static UNSUPPORTED_OPERATION: PyTypeRef;
     }
 
-    pub(super) fn make_unsupportedop(ctx: &PyContext) -> PyTypeRef {
+    pub(super) fn make_unsupportedop(ctx: &Context) -> PyTypeRef {
         PyType::new_ref(
             "UnsupportedOperation",
             vec![
-                ctx.exceptions.os_error.clone(),
-                ctx.exceptions.value_error.clone(),
+                ctx.exceptions.os_error.to_owned(),
+                ctx.exceptions.value_error.to_owned(),
             ],
             Default::default(),
             Default::default(),
-            ctx.types.type_type.clone(),
+            ctx.types.type_type.to_owned(),
         )
         .unwrap()
+    }
+
+    #[pyfunction]
+    fn text_encoding(
+        encoding: PyObjectRef,
+        _stacklevel: OptionalArg<i32>,
+        vm: &VirtualMachine,
+    ) -> PyResult<PyStrRef> {
+        if vm.is_none(&encoding) {
+            // TODO: This is `locale` encoding - but we don't have locale encoding yet
+            return Ok(vm.ctx.new_str("utf-8"));
+        }
+        encoding.try_into_value(vm)
     }
 
     #[cfg(test)]
@@ -3645,16 +3725,15 @@ mod _io {
 #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
 #[pymodule]
 mod fileio {
-    use super::Offset;
-    use super::_io::*;
+    use super::{Offset, _io::*};
     use crate::{
-        builtins::{PyStr, PyStrRef, PyTypeRef},
-        crt_fd::Fd,
-        function::{
-            ArgBytesLike, ArgMemoryBuffer, FuncArgs, IntoPyException, OptionalArg, OptionalOption,
-        },
+        builtins::{PyStr, PyStrRef},
+        common::crt_fd::Fd,
+        convert::ToPyException,
+        function::{ArgBytesLike, ArgMemoryBuffer, OptionalArg, OptionalOption},
         stdlib::os,
-        PyObjectRef, PyRef, PyResult, PyValue, TryFromObject, TypeProtocol, VirtualMachine,
+        types::{DefaultConstructor, Initializer},
+        AsObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
     };
     use crossbeam_utils::atomic::AtomicCell;
     use std::io::{Read, Write};
@@ -3760,7 +3839,7 @@ mod fileio {
 
     #[pyattr]
     #[pyclass(module = "io", name, base = "_RawIOBase")]
-    #[derive(Debug, PyValue)]
+    #[derive(Debug, PyPayload)]
     pub(super) struct FileIO {
         fd: AtomicCell<i32>,
         closefd: AtomicCell<bool>,
@@ -3769,7 +3848,7 @@ mod fileio {
     }
 
     #[derive(FromArgs)]
-    struct FileIOArgs {
+    pub struct FileIOArgs {
         #[pyarg(positional)]
         name: PyObjectRef,
         #[pyarg(any, default)]
@@ -3780,21 +3859,23 @@ mod fileio {
         opener: Option<PyObjectRef>,
     }
 
-    #[pyimpl(flags(BASETYPE, HAS_DICT))]
-    impl FileIO {
-        #[pyslot]
-        fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-            FileIO {
+    impl Default for FileIO {
+        fn default() -> Self {
+            Self {
                 fd: AtomicCell::new(-1),
                 closefd: AtomicCell::new(false),
                 mode: AtomicCell::new(Mode::empty()),
                 seekable: AtomicCell::new(None),
             }
-            .into_pyresult_with_type(vm, cls)
         }
+    }
 
-        #[pymethod(magic)]
-        fn init(zelf: PyRef<Self>, args: FileIOArgs, vm: &VirtualMachine) -> PyResult<()> {
+    impl DefaultConstructor for FileIO {}
+
+    impl Initializer for FileIO {
+        type Args = FileIOArgs;
+
+        fn init(zelf: PyRef<Self>, args: Self::Args, vm: &VirtualMachine) -> PyResult<()> {
             let mode_obj = args.mode.unwrap_or_else(|| PyStr::from("rb").into_ref(vm));
             let mode_str = mode_obj.as_str();
             let name = args.name;
@@ -3803,7 +3884,7 @@ mod fileio {
             zelf.mode.store(mode);
             let fd = if let Some(opener) = args.opener {
                 let fd = vm.invoke(&opener, (name.clone(), flags))?;
-                if !fd.isinstance(&vm.ctx.types.int_type) {
+                if !fd.fast_isinstance(vm.ctx.types.int_type) {
                     return Err(vm.new_type_error("expected integer from opener".to_owned()));
                 }
                 let fd = i32::try_from_object(vm, fd)?;
@@ -3834,13 +3915,16 @@ mod fileio {
             zelf.as_object().set_attr("name", name, vm)?;
             Ok(())
         }
+    }
 
-        #[pyproperty]
+    #[pyclass(with(DefaultConstructor, Initializer), flags(BASETYPE, HAS_DICT))]
+    impl FileIO {
+        #[pygetset]
         fn closed(&self) -> bool {
             self.fd.load() < 0
         }
 
-        #[pyproperty]
+        #[pygetset]
         fn closefd(&self) -> bool {
             self.closefd.load()
         }
@@ -3867,7 +3951,7 @@ mod fileio {
         fn writable(&self) -> bool {
             self.mode.load().contains(Mode::WRITABLE)
         }
-        #[pyproperty]
+        #[pygetset]
         fn mode(&self) -> &'static str {
             let mode = self.mode.load();
             if mode.contains(Mode::CREATED) {
@@ -3926,14 +4010,14 @@ mod fileio {
                 let mut bytes = vec![0; read_byte as usize];
                 let n = handle
                     .read(&mut bytes)
-                    .map_err(|err| err.into_pyexception(vm))?;
+                    .map_err(|err| err.to_pyexception(vm))?;
                 bytes.truncate(n);
                 bytes
             } else {
                 let mut bytes = vec![];
                 handle
                     .read_to_end(&mut bytes)
-                    .map_err(|err| err.into_pyexception(vm))?;
+                    .map_err(|err| err.to_pyexception(vm))?;
                 bytes
             };
 
@@ -3953,7 +4037,7 @@ mod fileio {
 
             let mut buf = obj.borrow_buf_mut();
             let mut f = handle.take(buf.len() as _);
-            let ret = f.read(&mut buf).map_err(|e| e.into_pyexception(vm))?;
+            let ret = f.read(&mut buf).map_err(|e| e.to_pyexception(vm))?;
 
             Ok(ret)
         }
@@ -3971,7 +4055,7 @@ mod fileio {
 
             let len = obj
                 .with_ref(|b| handle.write(b))
-                .map_err(|err| err.into_pyexception(vm))?;
+                .map_err(|err| err.to_pyexception(vm))?;
 
             //return number of bytes written
             Ok(len)
@@ -3986,7 +4070,7 @@ mod fileio {
             }
             let fd = zelf.fd.swap(-1);
             if fd >= 0 {
-                Fd(fd).close().map_err(|e| e.into_pyexception(vm))?;
+                Fd(fd).close().map_err(|e| e.to_pyexception(vm))?;
             }
             res
         }
